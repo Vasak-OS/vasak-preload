@@ -5,14 +5,14 @@
 //! mismo `PreloadProxy` que `vasak-preload-cli`.
 
 use crate::service::{EngineTask, PreloadService};
-use crate::{OBJECT_PATH, serve};
+use crate::{OBJECT_PATH, run, serve, wait_for_shutdown};
 use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 use vasak_preload_config::Config;
-use vasak_preload_orchestrator::{SqliteRepository, StateRepository};
+use vasak_preload_orchestrator::{ExeKey, MapSegment, SqliteRepository, StateRepository};
 use vasak_preload_protocol::{DaemonState, PreloadProxy};
 use zbus::proxy::CacheProperties;
 use zbus::{Connection, Guid, connection};
@@ -326,4 +326,200 @@ async fn recargar_antes_de_arrancar_el_motor_no_cambia_la_configuracion() {
         proxy.config().await.unwrap().modelo_ventana_activa_secs,
         4321
     );
+}
+
+/// Puebla los almacenes que lee la interfaz: `/usr/bin/bash` corriendo, activo
+/// y con dos mapas; `/usr/bin/vim` conocido pero inactivo.
+async fn poblar_almacenes(servidor: &Connection) {
+    let servicio = servidor
+        .object_server()
+        .interface::<_, PreloadService>(OBJECT_PATH)
+        .await
+        .expect("servicio publicado");
+    let stores = servicio.get().await.stores();
+    let mut stores = stores.write().await;
+
+    let bash = stores.ensure_exe(ExeKey::new("/usr/bin/bash".into()));
+    let vim = stores.ensure_exe(ExeKey::new("/usr/bin/vim".into()));
+    let exe = stores.exes.get_mut(bash).unwrap();
+    exe.mark_running(490);
+    exe.total_running_time = 40;
+    stores.exes.get_mut(vim).unwrap().total_running_time = 3;
+    let libc = stores.ensure_map(MapSegment::new("/usr/lib/libc.so.6".into(), 0, 4096, 1));
+    let ld = stores.ensure_map(MapSegment::new("/usr/lib/ld-linux.so.2".into(), 0, 2048, 1));
+    stores.attach_map(bash, libc);
+    stores.attach_map(bash, ld);
+    stores.active.update(&[bash], 490);
+}
+
+#[tokio::test]
+async fn las_predicciones_nombran_los_ejecutables_por_su_ruta() {
+    let dir = TempDir::new().unwrap();
+    let (servidor, _cliente, proxy) = publicar_sin_motor(config_de_prueba(dir.path())).await;
+    poblar_almacenes(&servidor).await;
+
+    // Sólo bash está activo: el predictor le da la probabilidad base.
+    let top = proxy.get_top_predictions(5).await.unwrap();
+    assert_eq!(top, vec![("/usr/bin/bash".to_string(), 0.8)]);
+    assert!(proxy.get_top_predictions(0).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn un_ejecutable_conocido_vuelve_con_su_estado() {
+    let dir = TempDir::new().unwrap();
+    let (servidor, _cliente, proxy) = publicar_sin_motor(config_de_prueba(dir.path())).await;
+    poblar_almacenes(&servidor).await;
+
+    let bash = proxy.get_exe_state("/usr/bin/bash").await.unwrap();
+    assert!(bash.has_value);
+    assert_eq!(bash.inner.path, "/usr/bin/bash");
+    assert!(bash.inner.running);
+    assert_eq!(bash.inner.total_running_time, 40);
+    assert_eq!(bash.inner.last_seen_time, 490);
+    assert_eq!(bash.inner.map_count, 2);
+    assert_eq!(bash.inner.prediction_probability, 0.8);
+
+    // Conocido pero nunca visto: 0 en `last_seen_time`, sin mapas ni
+    // probabilidad.
+    let vim = proxy.get_exe_state("/usr/bin/vim").await.unwrap();
+    assert!(vim.has_value);
+    assert!(!vim.inner.running);
+    assert_eq!(vim.inner.total_running_time, 3);
+    assert_eq!(vim.inner.last_seen_time, 0);
+    assert_eq!(vim.inner.map_count, 0);
+    assert_eq!(vim.inner.prediction_probability, 0.0);
+}
+
+/// Corre `run` —lo que hace `main` después de cargar la configuración— en un
+/// extremo del par, con `resultado_espera` en lugar de las señales. Mientras
+/// tanto, del otro lado, comprueba que el daemon atiende, marca el estado en
+/// disco y recién entonces da la señal. Devuelve lo que devolvió `run`.
+async fn correr_hasta_el_apagado(
+    config: Config,
+    resultado_espera: std::io::Result<()>,
+) -> Result<(), String> {
+    let repo = SqliteRepository::new(&config.persistencia.estado_path)
+        .await
+        .unwrap();
+    let (lado_servidor, lado_cliente) = UnixStream::pair().expect("par de sockets");
+    let servidor = connection::Builder::unix_stream(lado_servidor)
+        .server(Guid::generate())
+        .expect("guid")
+        .p2p();
+    let (senal, apagado) = tokio::sync::oneshot::channel();
+
+    let daemon = async {
+        run(servidor, config, async {
+            apagado.await.expect("emisor vivo")
+        })
+        .await
+        .map_err(|e| e.to_string())
+    };
+    let cliente = async {
+        let cliente = connection::Builder::unix_stream(lado_cliente)
+            .p2p()
+            .build()
+            .await
+            .expect("conectar el cliente");
+        let proxy = PreloadProxy::builder(&cliente)
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await
+            .expect("proxy");
+        // La interfaz atiende desde `serve_at`, antes de que el motor
+        // arranque: se espera a verlo corriendo.
+        while proxy.state().await.unwrap() != DaemonState::Running {
+            tokio::task::yield_now().await;
+        }
+        marcar(&repo).await;
+        senal.send(resultado_espera).unwrap();
+        cliente
+    };
+
+    let (resultado, _cliente) = timeout(APAGADO_MAXIMO, async { tokio::join!(daemon, cliente) })
+        .await
+        .expect("run no volvió después de la señal");
+
+    // `run` no vuelve hasta que el motor hizo su guardado final.
+    assert_ne!(model_time_en_disco(&repo).await, MARCA);
+    resultado
+}
+
+#[tokio::test]
+async fn el_daemon_atiende_hasta_el_apagado_y_guarda_al_salir() {
+    let dir = TempDir::new().unwrap();
+    let resultado = correr_hasta_el_apagado(config_de_prueba(dir.path()), Ok(())).await;
+    assert_eq!(resultado, Ok(()));
+}
+
+#[tokio::test]
+async fn si_esperar_la_senal_falla_el_motor_igual_se_apaga() {
+    let dir = TempDir::new().unwrap();
+    let resultado = correr_hasta_el_apagado(
+        config_de_prueba(dir.path()),
+        Err(std::io::Error::other("sin manejador de señales")),
+    )
+    .await;
+    assert_eq!(resultado, Err("sin manejador de señales".to_string()));
+}
+
+/// Hace que `espera` registre sus manejadores (el primer `poll` llama a
+/// `signal`) y le manda `senal` al propio proceso.
+async fn senal_a_mi_mismo(
+    espera: &mut std::pin::Pin<&mut impl Future<Output = std::io::Result<()>>>,
+    senal: nix::sys::signal::Signal,
+) {
+    tokio::select! {
+        biased;
+        _ = espera.as_mut() => panic!("terminó sin ninguna señal"),
+        _ = std::future::ready(()) => {}
+    }
+    nix::sys::signal::kill(nix::unistd::Pid::this(), senal).expect("kill");
+}
+
+#[tokio::test]
+async fn sigterm_y_sigint_terminan_la_espera_de_apagado() {
+    // Las dos en la misma prueba: los manejadores son de todo el proceso, y
+    // una señal mandada por otra prueba en paralelo despertaría a ésta.
+    // Antes del primer `kill` hay un manejador de tokio instalado para cada
+    // señal, así que ninguna puede matar al proceso de pruebas.
+    let espera = wait_for_shutdown();
+    tokio::pin!(espera);
+    senal_a_mi_mismo(&mut espera, nix::sys::signal::Signal::SIGTERM).await;
+    timeout(Duration::from_secs(10), espera)
+        .await
+        .expect("SIGTERM no terminó la espera")
+        .unwrap();
+
+    let espera = wait_for_shutdown();
+    tokio::pin!(espera);
+    senal_a_mi_mismo(&mut espera, nix::sys::signal::Signal::SIGINT).await;
+    timeout(Duration::from_secs(10), espera)
+        .await
+        .expect("SIGINT no terminó la espera")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn recargar_con_el_motor_corriendo_reemplaza_la_configuracion() {
+    // Depende de la máquina: `ReloadConfig` lee `/etc/vasak-preload/config.toml`
+    // y la del usuario. Sin ellas (el runner del CI) carga los valores por
+    // omisión; con una válida, la suya. En ningún caso trae 4321.
+    let dir = TempDir::new().unwrap();
+    let mut config = config_de_prueba(dir.path());
+    config.modelo.ventana_activa = Duration::from_secs(4321);
+    let daemon = levantar(config).await;
+
+    daemon.proxy.reload_config().await.unwrap();
+    assert_ne!(
+        daemon
+            .proxy
+            .config()
+            .await
+            .unwrap()
+            .modelo_ventana_activa_secs,
+        4321
+    );
+
+    apagar(daemon.motor).await;
 }

@@ -115,6 +115,13 @@ impl PreloadService {
         Ok(EngineTask { cancel, task })
     }
 
+    /// Los almacenes que lee la interfaz, para poblarlos desde las pruebas
+    /// mientras el motor no los comparta (issue #11).
+    #[cfg(test)]
+    pub(crate) fn stores(&self) -> Arc<RwLock<Stores>> {
+        self.stores.clone()
+    }
+
     /// Manda un evento al motor. Falla si el motor todavía no arrancó (el
     /// servicio se publica antes) o si ya terminó.
     async fn send(&self, event: ControlEvent) -> zbus::fdo::Result<()> {

@@ -113,3 +113,66 @@ fn la_configuracion_ida_y_vuelta_conserva_cada_campo() {
     assert_eq!(vuelta.persistencia_autosave_secs, 0);
     assert_eq!(ConfigSnapshot::SIGNATURE.to_string(), "(ttbbbt)");
 }
+
+#[test]
+fn un_valor_de_otra_forma_no_se_convierte_en_estado_estadisticas_ni_configuracion() {
+    let texto = || OwnedValue::try_from(Value::from("Running")).unwrap();
+
+    assert!(DaemonState::try_from(texto()).is_err());
+    assert!(DaemonStats::try_from(texto()).is_err());
+    assert!(ConfigSnapshot::try_from(texto()).is_err());
+}
+
+#[test]
+fn las_cuatro_conversiones_de_las_estructuras_van_y_vuelven() {
+    // Directo de `Value` y directo a `OwnedValue`, sin pasar por el otro.
+    let stats = DaemonStats {
+        exe_count: 5,
+        ..DaemonStats::default()
+    };
+    let vuelta = DaemonStats::try_from(Value::from(stats.clone())).unwrap();
+    assert_eq!(vuelta.exe_count, 5);
+    let owned = OwnedValue::try_from(stats).unwrap();
+    assert_eq!(DaemonStats::try_from(owned).unwrap().exe_count, 5);
+
+    let config = ConfigSnapshot {
+        modelo_ciclo_secs: 7,
+        ..ConfigSnapshot::default()
+    };
+    let vuelta = ConfigSnapshot::try_from(Value::from(config.clone())).unwrap();
+    assert_eq!(vuelta.modelo_ciclo_secs, 7);
+    let owned = OwnedValue::try_from(config).unwrap();
+    assert_eq!(
+        ConfigSnapshot::try_from(owned).unwrap().modelo_ciclo_secs,
+        7
+    );
+}
+
+#[test]
+fn un_campo_de_otro_tipo_no_se_convierte() {
+    // Seis campos como la configuración, pero el último es texto.
+    let config = Value::from((20u64, 3600u64, true, true, true, "300"));
+    assert!(ConfigSnapshot::try_from(config.try_clone().unwrap()).is_err());
+
+    let owned = OwnedValue::try_from(config).unwrap();
+    assert!(ConfigSnapshot::try_from(owned).is_err());
+
+    // Las estadísticas con el estado como texto en lugar de `u`, y con el
+    // último campo (el porcentaje de memoria, `y`) como `u`.
+    for malo in [0, 18] {
+        let mut estructura = zvariant::StructureBuilder::new();
+        for campo in 0..19 {
+            estructura = if campo == malo {
+                estructura.add_field("x")
+            } else if campo == 0 {
+                estructura.add_field(1u32)
+            } else {
+                estructura.add_field(0u32)
+            };
+        }
+        let stats = Value::from(estructura.build().unwrap());
+        let owned = OwnedValue::try_from(stats.try_clone().unwrap()).unwrap();
+        assert!(DaemonStats::try_from(stats).is_err(), "campo {malo}");
+        assert!(DaemonStats::try_from(owned).is_err(), "campo {malo}");
+    }
+}

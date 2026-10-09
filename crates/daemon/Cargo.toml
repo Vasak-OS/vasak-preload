@@ -27,4 +27,5 @@ dirs.workspace = true
 toml_edit.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
+nix.workspace = true
 zbus = { workspace = true, features = ["p2p"] }

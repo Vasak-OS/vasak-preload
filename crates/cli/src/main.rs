@@ -72,13 +72,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let proxy = PreloadProxy::new(&conn).await?;
 
-    match cli.command {
+    print!("{}", run(&proxy, cli.command).await?);
+
+    Ok(())
+}
+
+/// Ejecuta `command` contra el daemon y devuelve lo que hay que imprimir.
+async fn run(
+    proxy: &PreloadProxy<'_>,
+    command: Commands,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut out = String::new();
+    match command {
         Commands::Status => {
             let state = proxy.state().await?;
-            println!("Estado: {:?}", state);
+            let _ = writeln!(out, "Estado: {:?}", state);
         }
-        Commands::Stats => print!("{}", format_stats(&proxy.stats().await?)),
-        Commands::Config => print!("{}", format_config(&proxy.config().await?)),
+        Commands::Stats => out = format_stats(&proxy.stats().await?),
+        Commands::Config => out = format_config(&proxy.config().await?),
         Commands::Pause => {
             proxy.pause().await?;
             info!("Prefetch pausado");
@@ -97,27 +108,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Top { n } => {
             let predictions = proxy.get_top_predictions(n).await?;
-            println!("Top {} predicciones:", n);
+            let _ = writeln!(out, "Top {} predicciones:", n);
             for (i, (path, prob)) in predictions.iter().enumerate() {
-                println!("  {}. {} ({:.2}%)", i + 1, path, prob * 100.0);
+                let _ = writeln!(out, "  {}. {} ({:.2}%)", i + 1, path, prob * 100.0);
             }
         }
         Commands::Exe { path } => {
             let path_str = path.to_string_lossy().to_string();
             let state = proxy.get_exe_state(&path_str).await?;
             if state.has_value {
-                print!("{}", format_exe_state(&state.inner));
+                out = format_exe_state(&state.inner);
             } else {
-                println!("Ejecutable no encontrado: {}", path_str);
+                let _ = writeln!(out, "Ejecutable no encontrado: {}", path_str);
             }
         }
         Commands::Tick => {
             // Para testing: no hay método directo, se haría via control interno
-            println!("Tick manual no implementado via D-Bus (usar signal interno)");
+            let _ = writeln!(
+                out,
+                "Tick manual no implementado via D-Bus (usar signal interno)"
+            );
         }
     }
 
-    Ok(())
+    Ok(out)
 }
 
 fn format_stats(stats: &DaemonStats) -> String {

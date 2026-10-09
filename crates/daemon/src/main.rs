@@ -74,15 +74,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Publicar el servicio en el bus del sistema. Si el nombre no se puede
     // tomar, el motor no llega a arrancar.
-    let (_conn, engine) = serve(connection::Builder::system()?.name(BUS_NAME)?, config).await?;
+    run(
+        connection::Builder::system()?.name(BUS_NAME)?,
+        config,
+        wait_for_shutdown(),
+    )
+    .await
+}
 
-    info!("Conectado al bus del sistema");
+/// Publica el servicio, lo atiende hasta que termina `shutdown` y apaga el
+/// motor (con su guardado final) antes de volver.
+async fn run(
+    builder: connection::Builder<'_>,
+    config: Config,
+    shutdown: impl Future<Output = std::io::Result<()>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_conn, engine) = serve(builder, config).await?;
+    info!("Servicio publicado");
 
-    wait_for_shutdown().await?;
+    let result = shutdown.await;
     info!("Apagando");
     engine.shutdown().await;
 
-    Ok(())
+    Ok(result?)
 }
 
 /// Publica el servicio en la conexión que arma `builder` y arranca el motor
