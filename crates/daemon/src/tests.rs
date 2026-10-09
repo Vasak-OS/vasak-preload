@@ -4,8 +4,8 @@
 //! modo peer-to-peer: no hace falta bus del sistema ni root. El cliente usa el
 //! mismo `PreloadProxy` que `vasak-preload-cli`.
 
-use crate::serve;
-use crate::service::EngineTask;
+use crate::service::{EngineTask, PreloadService};
+use crate::{OBJECT_PATH, serve};
 use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -77,6 +77,43 @@ async fn levantar(config: Config) -> Daemon {
         proxy,
         motor,
     }
+}
+
+/// Publica el servicio en un extremo del par **sin arrancar el motor**: el
+/// tramo entre `serve_at` y `start_engine`, en el que la interfaz ya atiende.
+async fn publicar_sin_motor(config: Config) -> (Connection, Connection, PreloadProxy<'static>) {
+    let (lado_servidor, lado_cliente) = UnixStream::pair().expect("par de sockets");
+
+    let servicio = PreloadService::new(config).await.expect("servicio");
+    let servidor = connection::Builder::unix_stream(lado_servidor)
+        .server(Guid::generate())
+        .expect("guid")
+        .p2p()
+        .serve_at(OBJECT_PATH, servicio)
+        .expect("publicar")
+        .build();
+    let cliente = connection::Builder::unix_stream(lado_cliente).p2p().build();
+
+    let (servidor, cliente) = tokio::join!(servidor, cliente);
+    let servidor = servidor.expect("publicar el servicio");
+    let cliente = cliente.expect("conectar el cliente");
+
+    let proxy = PreloadProxy::builder(&cliente)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .expect("proxy");
+
+    (servidor, cliente, proxy)
+}
+
+/// El error tiene que ser `org.freedesktop.DBus.Error.Failed`.
+fn es_failed(error: &zbus::Error) -> bool {
+    matches!(
+        error,
+        zbus::Error::MethodError(nombre, _, _)
+            if nombre.as_str() == "org.freedesktop.DBus.Error.Failed"
+    )
 }
 
 /// Deja `MARCA` como `model_time` del estado en disco.
@@ -246,4 +283,47 @@ async fn el_apagado_termina_el_motor_y_guarda() {
         }
         otro => panic!("se esperaba org.freedesktop.DBus.Error.Failed, llegó {otro:?}"),
     }
+}
+
+#[tokio::test]
+async fn guardar_ahora_antes_de_arrancar_el_motor_falla() {
+    let dir = TempDir::new().unwrap();
+    let (_servidor, _cliente, proxy) = publicar_sin_motor(config_de_prueba(dir.path())).await;
+
+    // Nadie va a guardar nada: responder Ok sería mentirle a quien pidió el
+    // guardado.
+    let error = proxy.save_now().await.unwrap_err();
+    assert!(
+        es_failed(&error),
+        "se esperaba Error.Failed, llegó {error:?}"
+    );
+    match error {
+        zbus::Error::MethodError(_, mensaje, _) => {
+            assert_eq!(mensaje.as_deref(), Some("el motor no está corriendo"));
+        }
+        otro => panic!("se esperaba un error de método, llegó {otro:?}"),
+    }
+}
+
+#[tokio::test]
+async fn recargar_antes_de_arrancar_el_motor_no_cambia_la_configuracion() {
+    let dir = TempDir::new().unwrap();
+    let mut config = config_de_prueba(dir.path());
+    // Un valor que no trae ninguna configuración real: si la recarga la
+    // reemplazara, se notaría.
+    config.modelo.ventana_activa = Duration::from_secs(4321);
+    let (_servidor, _cliente, proxy) = publicar_sin_motor(config).await;
+
+    // `ReloadConfig` lee `/etc/vasak-preload/config.toml` y la del usuario. Si
+    // la de la máquina es inválida falla antes, también con Error.Failed; en
+    // los dos casos la configuración publicada tiene que quedar igual.
+    let error = proxy.reload_config().await.unwrap_err();
+    assert!(
+        es_failed(&error),
+        "se esperaba Error.Failed, llegó {error:?}"
+    );
+    assert_eq!(
+        proxy.config().await.unwrap().modelo_ventana_activa_secs,
+        4321
+    );
 }

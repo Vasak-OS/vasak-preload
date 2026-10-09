@@ -115,13 +115,13 @@ impl PreloadService {
         Ok(EngineTask { cancel, task })
     }
 
-    /// Manda un evento al motor, si está corriendo.
+    /// Manda un evento al motor. Falla si el motor todavía no arrancó (el
+    /// servicio se publica antes) o si ya terminó.
     async fn send(&self, event: ControlEvent) -> zbus::fdo::Result<()> {
-        if let Some(tx) = self.control_tx.lock().await.as_ref() {
-            tx.send(event)
-                .map_err(|_| FdoError::Failed("el motor no está corriendo".into()))?;
-        }
-        Ok(())
+        let not_running = || FdoError::Failed("el motor no está corriendo".into());
+        let guard = self.control_tx.lock().await;
+        let tx = guard.as_ref().ok_or_else(not_running)?;
+        tx.send(event).map_err(|_| not_running())
     }
 }
 
