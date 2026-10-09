@@ -1,0 +1,34 @@
+[Unit]
+Description=VasakOS Preload Daemon
+Documentation=https://github.com/VasakOS/vasak-preload
+After=network.target
+ConditionPathExists=/etc/vasak-preload/config.toml
+
+[Service]
+Type=dbus
+BusName=org.vasakos.Preload
+ExecStart=/usr/bin/vasak-preload --config /etc/vasak-preload/config.toml
+Restart=on-failure
+RestartSec=5
+User=vasak-preload
+Group=vasak-preload
+# Seguridad
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Acceso a /proc para escanear procesos
+ProcSubset=pid
+# Capabilities mínimas
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE
+
+[Install]
+WantedBy=multi-user.target

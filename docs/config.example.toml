@@ -1,0 +1,56 @@
+# Configuración de ejemplo para vasak-preload
+# Copiar a /etc/vasak-preload/config.toml o ~/.config/vasak-preload/config.toml
+
+[modelo]
+# Intervalo entre ciclos del modelo (en segundos)
+ciclo = 20
+
+# Ventana de tiempo para considerar una aplicación "activa" (en segundos)
+ventana_activa = 3600
+
+# Tamaño máximo del modelo (número de estados)
+max_estados = 2000
+
+# Umbral de probabilidad mínima para considerar una transición
+umbral_transicion = 0.01
+
+[sistema]
+# Si se debe escanear procesos activos
+doscan = true
+
+# Si se debe ejecutar predicción
+dopredict = true
+
+# Si se debe ejecutar prefetch
+doprefetch = true
+
+# Intervalo de autoguardado (en segundos). 0 = deshabilitado.
+autosave = 300
+
+# Prefijos de ejecutables a monitorear (vacío = todos)
+# exeprefix = ["/usr/bin", "/opt"]
+
+# Prefijos de mapeos de memoria a monitorear (vacío = todos)
+# mapprefix = ["/usr/lib", "/usr/lib64"]
+
+# Tamaño máximo de mapa a considerar para prefetch (en bytes)
+max_mapa = 104857600  # 100 MiB
+
+# Umbral de memoria libre mínima para hacer prefetch (porcentaje 0-100)
+mem_libre_min_pct = 10
+
+# Tamaño de página del sistema (para cálculos)
+tamano_pagina = 4096
+
+[persistencia]
+# Ruta al archivo de estado (SQLite)
+estado_path = "/var/lib/vasak-preload/state.sqlite"
+
+# Intervalo de autoguardado (en segundos). None = usar valor de sistema.
+# autosave_interval = 300
+
+# Si guardar al apagar
+save_on_shutdown = true
+
+# Versión del esquema de la base de datos
+version_esquema = 1

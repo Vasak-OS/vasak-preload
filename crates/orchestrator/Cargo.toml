@@ -1,0 +1,29 @@
+[package]
+name = "vasak-preload-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[dependencies]
+vasak-preload-config = { path = "../config", package = "vasak-preload-config" }
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+slotmap.workspace = true
+procfs.workspace = true
+nix.workspace = true
+sqlx.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+moka.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
