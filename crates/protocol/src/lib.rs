@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+mod proxy;
 mod types;
 
+pub use proxy::{PreloadProxy, PreloadProxyBlocking};
 pub use types::*;

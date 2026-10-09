@@ -12,8 +12,6 @@ name = "vasak-preload-cli"
 path = "src/main.rs"
 
 [dependencies]
-vasak-preload-config = { path = "../config", package = "vasak-preload-config" }
-orchestrator = { path = "../orchestrator", package = "vasak-preload-orchestrator" }
 vasak-preload-protocol = { path = "../protocol", package = "vasak-preload-protocol" }
 serde.workspace = true
 serde_json.workspace = true

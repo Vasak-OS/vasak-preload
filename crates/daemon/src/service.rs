@@ -2,99 +2,57 @@
 
 #![forbid(unsafe_code)]
 
-use vasak_preload_config::Config;
-use vasak_preload_orchestrator::{
-    clock::SystemClock, engine::{ControlEvent, PreloadEngine, ReloadBundle, Services},
-    observation::DefaultAdmissionPolicy, observation::DefaultModelUpdater,
-    observation::ProcfsScanner, persistence::SqliteRepository, prediction::MarkovPredictor,
-    prefetch::GreedyPrefetchPlanner, prefetch::NoopPrefetcher, Stores,
-};
-use vasak_preload_protocol::{DaemonState, DaemonStats, ExeState, ExeStateWrapper};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
-use zbus::fdo::{Result as FdoResult, Error as FdoError};
+use tracing::{error, info};
+use vasak_preload_config::Config;
+use vasak_preload_orchestrator::{
+    ControlEvent, DefaultAdmissionPolicy, DefaultModelUpdater, ExeKey, GreedyPrefetchPlanner,
+    MarkovPredictor, NoopPrefetcher, Predictor, PreloadEngine, ProcfsScanner, ReloadBundle,
+    Services, SqliteRepository, Stores, SystemClock,
+};
+use vasak_preload_protocol::{ConfigSnapshot, DaemonState, DaemonStats, ExeState, ExeStateWrapper};
+use zbus::fdo::Error as FdoError;
 use zbus::interface;
 
-/// Handle para controlar el motor desde el servicio.
-pub struct EngineHandle {
-    control_tx: mpsc::UnboundedSender<ControlEvent>,
+/// Tarea del motor en background. Quien la tiene es quien la apaga.
+pub struct EngineTask {
     cancel: CancellationToken,
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task: tokio::task::JoinHandle<()>,
 }
 
-impl EngineHandle {
-    pub fn new(
-        control_tx: mpsc::UnboundedSender<ControlEvent>,
-        cancel: CancellationToken,
-        task: tokio::task::JoinHandle<()>,
-    ) -> Self {
-        Self {
-            control_tx,
-            cancel,
-            task: Mutex::new(Some(task)),
-        }
-    }
-
-    pub fn send(&self, event: ControlEvent) -> Result<(), mpsc::error::SendError<ControlEvent>> {
-        self.control_tx.send(event)
-    }
-
-    pub async fn cancel(&self) {
+impl EngineTask {
+    /// Pide al motor que se detenga y espera a que termine (incluye el guardado final).
+    pub async fn shutdown(self) {
         self.cancel.cancel();
-        if let Some(task) = self.task.lock().await.take() {
-            let _ = task.await;
-        }
+        let _ = self.task.await;
     }
 }
 
 /// Servicio D-Bus que expone la funcionalidad del daemon.
 pub struct PreloadService {
     config: RwLock<Config>,
-    engine: Mutex<Option<EngineHandle>>,
+    control_tx: Mutex<Option<mpsc::UnboundedSender<ControlEvent>>>,
     stores: Arc<RwLock<Stores>>,
     stats: Arc<Mutex<DaemonStats>>,
 }
 
 impl PreloadService {
-    /// Crea un nuevo servicio e inicializa el motor.
+    /// Crea un nuevo servicio. El motor se arranca aparte, con `start_engine`.
     pub async fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
-        let stores = Arc::new(RwLock::new(orchestrator::Stores::default()));
-        let stats = Mutex::new(DaemonStats {
-            state: DaemonState::Starting,
-            scan_count: 0,
-            exe_count: 0,
-            map_count: 0,
-            edge_count: 0,
-            active_count: 0,
-            model_time: 0,
-            last_tick_scan_id: 0,
-            last_tick_exes_added: 0,
-            last_tick_maps_added: 0,
-            last_tick_edges_added: 0,
-            last_tick_edges_updated: 0,
-            last_tick_prediction_exes: 0,
-            last_tick_prediction_max_prob: 0.0,
-            last_tick_prefetch_attempted: 0,
-            last_tick_prefetch_succeeded: 0,
-            last_tick_prefetch_failed: 0,
-            last_tick_prefetch_bytes: 0,
-            last_tick_mem_free_pct: 255,
-        });
-
         Ok(Self {
             config: RwLock::new(config),
-            engine: Mutex::new(None),
-            stores,
-            stats,
+            control_tx: Mutex::new(None),
+            stores: Arc::new(RwLock::new(Stores::default())),
+            stats: Arc::new(Mutex::new(DaemonStats::default())),
         })
     }
 
     /// Inicia el motor en background.
-    pub async fn start_engine(&self) -> Result<EngineHandle, Box<dyn std::error::Error>> {
+    pub async fn start_engine(&self) -> Result<EngineTask, Box<dyn std::error::Error>> {
         let config = self.config.read().await.clone();
 
         // Crear repositorio de persistencia
@@ -117,7 +75,7 @@ impl PreloadService {
         };
 
         // Cargar o crear motor
-        let engine = if config.persistencia.estado_path.exists() {
+        let mut engine = if config.persistencia.estado_path.exists() {
             PreloadEngine::load(config.clone(), services).await?
         } else {
             PreloadEngine::new(config.clone(), services).await?
@@ -125,22 +83,17 @@ impl PreloadService {
 
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
-        let stores = self.stores.clone();
-        let stats = self.stats.clone();
 
-        // Clonar para el task
-        let mut engine = engine;
-        let cancel_clone = cancel.clone();
-
+        let cancel_engine = cancel.clone();
         let task = tokio::spawn(async move {
-            if let Err(e) = engine.run_until(cancel_clone, control_rx).await {
+            if let Err(e) = engine.run_until(cancel_engine, control_rx).await {
                 error!("Motor terminó con error: {}", e);
             }
         });
 
         // Task para actualizar stats periódicamente
-        let stores_clone = stores.clone();
-        let stats_clone = stats.clone();
+        let stores = self.stores.clone();
+        let stats = self.stats.clone();
         let cancel_stats = cancel.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -149,21 +102,26 @@ impl PreloadService {
                 if cancel_stats.is_cancelled() {
                     break;
                 }
-                update_stats(&stores_clone, &stats_clone).await;
+                update_stats(&stores, &stats).await;
             }
         });
 
-        let handle = EngineHandle::new(control_tx, cancel, task);
-        *self.engine.lock().await = Some(handle);
+        *self.control_tx.lock().await = Some(control_tx);
 
         // Actualizar estado inicial
-        {
-            let mut stats = self.stats.lock().await;
-            stats.state = DaemonState::Running;
-        }
+        self.stats.lock().await.state = DaemonState::Running;
         update_stats(&self.stores, &self.stats).await;
 
-        Ok(self.engine.lock().await.as_ref().unwrap().clone())
+        Ok(EngineTask { cancel, task })
+    }
+
+    /// Manda un evento al motor, si está corriendo.
+    async fn send(&self, event: ControlEvent) -> zbus::fdo::Result<()> {
+        if let Some(tx) = self.control_tx.lock().await.as_ref() {
+            tx.send(event)
+                .map_err(|_| FdoError::Failed("el motor no está corriendo".into()))?;
+        }
+        Ok(())
     }
 }
 
@@ -202,7 +160,13 @@ impl PreloadService {
             sistema_doscan: config.sistema.doscan,
             sistema_dopredict: config.sistema.dopredict,
             sistema_doprefetch: config.sistema.doprefetch,
-            persistencia_autosave_secs: config.persistencia.autosave_interval.map(|d| d.as_secs()),
+            // El intervalo que usa el motor: sin uno propio de persistencia,
+            // el del sistema. 0 sólo si de verdad está deshabilitado.
+            persistencia_autosave_secs: config
+                .persistencia
+                .autosave_interval
+                .unwrap_or(config.sistema.autosave)
+                .as_secs(),
         })
     }
 
@@ -221,10 +185,7 @@ impl PreloadService {
     }
 
     async fn save_now(&self) -> zbus::fdo::Result<()> {
-        if let Some(engine) = self.engine.lock().await.as_ref() {
-            engine.send(ControlEvent::SaveNow)?;
-        }
-        Ok(())
+        self.send(ControlEvent::SaveNow).await
     }
 
     async fn reload_config(&self) -> zbus::fdo::Result<()> {
@@ -233,29 +194,22 @@ impl PreloadService {
             dirs::config_dir()
                 .map(|d| d.join("vasak-preload/config.toml"))
                 .unwrap_or_default(),
-        ])?;
+        ])
+        .map_err(|e| FdoError::Failed(format!("configuración inválida: {e}")))?;
 
-        if let Some(engine) = self.engine.lock().await.as_ref() {
-            let admission = Box::new(DefaultAdmissionPolicy::new(
+        let bundle = ReloadBundle {
+            config: new_config.clone(),
+            admission: Box::new(DefaultAdmissionPolicy::new(
                 new_config.sistema.exeprefix.clone(),
                 new_config.sistema.mapprefix.clone(),
                 new_config.sistema.max_mapa,
-            ));
-            let updater = Box::new(DefaultModelUpdater::new());
-            let predictor = Box::new(MarkovPredictor::new());
-            let planner = Box::new(GreedyPrefetchPlanner::new());
-            let prefetcher = Box::new(NoopPrefetcher);
-
-            let bundle = ReloadBundle {
-                config: new_config.clone(),
-                admission,
-                updater,
-                predictor,
-                planner,
-                prefetcher,
-            };
-            engine.send(ControlEvent::Reload(Box::new(bundle)))?;
-        }
+            )),
+            updater: Box::new(DefaultModelUpdater::new()),
+            predictor: Box::new(MarkovPredictor::new()),
+            planner: Box::new(GreedyPrefetchPlanner::new()),
+            prefetcher: Box::new(NoopPrefetcher),
+        };
+        self.send(ControlEvent::Reload(Box::new(bundle))).await?;
 
         *self.config.write().await = new_config;
         info!("Configuración recargada");
@@ -264,13 +218,10 @@ impl PreloadService {
 
     async fn get_top_predictions(&self, n: u32) -> zbus::fdo::Result<Vec<(String, f32)>> {
         let stores = self.stores.read().await;
-        let config = self.config.read().await;
-        let predictor = MarkovPredictor::new();
-        let prediction = predictor.predict(&stores);
-        let top = prediction.top_n(n as usize);
+        let prediction = MarkovPredictor::new().predict(&stores);
 
         let mut result = Vec::new();
-        for (exe_id, prob) in top {
+        for (exe_id, prob) in prediction.top_n(n as usize) {
             if let Some(exe) = stores.exes.get(exe_id) {
                 result.push((exe.key.path().to_string_lossy().to_string(), prob));
             }
@@ -280,26 +231,26 @@ impl PreloadService {
 
     async fn get_exe_state(&self, path: String) -> zbus::fdo::Result<ExeStateWrapper> {
         let stores = self.stores.read().await;
-        let config = self.config.read().await;
 
-        let exe_key = orchestrator::domain::ExeKey::new(PathBuf::from(&path));
-        let Some(exe_id) = stores.exes.id_by_key(&exe_key) else {
+        let exe_key = ExeKey::new(PathBuf::from(&path));
+        let Some(exe) = stores
+            .exes
+            .id_by_key(&exe_key)
+            .and_then(|id| stores.exes.get(id).map(|exe| (id, exe)))
+        else {
             return Ok(ExeStateWrapper::none());
         };
+        let (exe_id, exe) = exe;
 
-        let exe = stores.exes.get(exe_id).unwrap();
-        let predictor = MarkovPredictor::new();
-        let prediction = predictor.predict(&stores);
-        let prob = prediction.get_probability(exe_id);
-        let map_count = stores.exe_maps.maps_for_exe(exe_id).len() as u32;
+        let prediction = MarkovPredictor::new().predict(&stores);
 
         Ok(ExeStateWrapper::some(ExeState {
             path,
             running: exe.running,
             total_running_time: exe.total_running_time,
-            last_seen_time: exe.last_seen_time,
-            prediction_probability: prob,
-            map_count,
+            last_seen_time: exe.last_seen_time.unwrap_or(0),
+            prediction_probability: prediction.get_probability(exe_id),
+            map_count: stores.exe_maps.maps_for_exe(exe_id).len() as u32,
         }))
     }
 }

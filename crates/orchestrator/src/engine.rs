@@ -102,7 +102,10 @@ impl PreloadEngine {
             self.services.scanner.scan(now, self.scan_id)?
         } else {
             vec![
-                ObservationEvent::ObsBegin { time: now, scan_id: self.scan_id },
+                ObservationEvent::ObsBegin {
+                    time: now,
+                    scan_id: self.scan_id,
+                },
                 ObservationEvent::ObsEnd {
                     time: now,
                     scan_id: self.scan_id,
@@ -370,7 +373,12 @@ impl PreloadEngine {
         };
 
         for map in snapshot.state.maps {
-            let segment = MapSegment::new(PathBuf::from(map.path), map.offset, map.length, map.update_time);
+            let segment = MapSegment::new(
+                PathBuf::from(map.path),
+                map.offset,
+                map.length,
+                map.update_time,
+            );
             stores.ensure_map(segment);
         }
 
@@ -402,7 +410,11 @@ impl PreloadEngine {
             let map_id = stores
                 .maps
                 .iter()
-                .find(|(_, m)| m.path.to_string_lossy() == record.map_path && m.offset == record.map_offset && m.length == record.map_length)
+                .find(|(_, m)| {
+                    m.path.to_string_lossy() == record.map_path
+                        && m.offset == record.map_offset
+                        && m.length == record.map_length
+                })
                 .map(|(id, _)| id)
                 .ok_or_else(|| Error::MapMissing(PathBuf::from(record.map_path.clone())))?;
             stores.attach_map(exe_id, map_id);
@@ -444,10 +456,13 @@ mod tests {
     use crate::config::{Config, Modelo, Persistencia, Sistema};
     use crate::domain::{ExeKey, MapKey, MapSegment, MarkovState, MemStat};
     use crate::observation::{AdmissionDecision, AdmissionPolicy, CandidateExe, Completeness};
+    use crate::observation::{DefaultAdmissionPolicy, DefaultModelUpdater};
     use crate::observation::{ModelUpdater, Observation, ObservationEvent, Scanner};
     use crate::persistence::NoopRepository;
     use crate::prediction::{Prediction, Predictor};
-    use crate::prefetch::{PrefetchPlan, PrefetchPlanner, PrefetchReport, Prefetcher};
+    use crate::prefetch::{
+        NoopPrefetcher, PrefetchPlan, PrefetchPlanner, PrefetchReport, Prefetcher,
+    };
     use crate::stores::EdgeKey;
     use async_trait::async_trait;
     use proptest::prelude::*;
@@ -665,7 +680,8 @@ mod tests {
         let mut engine = PreloadEngine::new(config, services).await.unwrap();
         engine.tick().await.unwrap();
 
-        // Verificar que el tiempo avanzó
-        assert_eq!(engine.stores.model_time, 1001);
+        // El tiempo del modelo es lógico: avanza un ciclo por tick, sin mirar
+        // el reloj (que sólo se usa para dormir entre ticks).
+        assert_eq!(engine.stores.model_time, 1);
     }
 }

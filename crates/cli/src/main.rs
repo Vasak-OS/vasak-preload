@@ -5,13 +5,21 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand};
-use protocol::{DaemonState, ExeState};
+use std::fmt::Write as _;
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::info;
+use vasak_preload_protocol::{ConfigSnapshot, DaemonStats, ExeState, PreloadProxy};
 use zbus::Connection;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Parser, Debug)]
-#[command(name = "vasak-preload-cli", version, about = "CLI client for vasak-preload daemon")]
+#[command(
+    name = "vasak-preload-cli",
+    version,
+    about = "CLI client for vasak-preload daemon"
+)]
 struct Cli {
     /// Comando a ejecutar.
     #[command(subcommand)]
@@ -53,8 +61,7 @@ enum Commands {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .init();
 
@@ -63,49 +70,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Conectar al bus del sistema
     let conn = Connection::system().await?;
 
-    // Obtener proxy del servicio
-    let proxy = zbus::Proxy::new(
-        &conn,
-        "org.vasakos.Preload",
-        "/org/vasakos/Preload",
-        "org.vasakos.Preload1",
-    )
-    .await?;
+    let proxy = PreloadProxy::new(&conn).await?;
 
     match cli.command {
         Commands::Status => {
-            let state: DaemonState = proxy.get_property("State").await?;
+            let state = proxy.state().await?;
             println!("Estado: {:?}", state);
         }
-        Commands::Stats => {
-            let stats = proxy.call_method("Stats", &()).await?.body()?;
-            print_stats(&stats);
-        }
-        Commands::Config => {
-            let config = proxy.call_method("Config", &()).await?.body()?;
-            print_config(&config);
-        }
+        Commands::Stats => print!("{}", format_stats(&proxy.stats().await?)),
+        Commands::Config => print!("{}", format_config(&proxy.config().await?)),
         Commands::Pause => {
-            proxy.call_method("Pause", &()).await?;
+            proxy.pause().await?;
             info!("Prefetch pausado");
         }
         Commands::Resume => {
-            proxy.call_method("Resume", &()).await?;
+            proxy.resume().await?;
             info!("Prefetch reanudado");
         }
         Commands::Save => {
-            proxy.call_method("SaveNow", &()).await?;
+            proxy.save_now().await?;
             info!("Guardado solicitado");
         }
         Commands::Reload => {
-            proxy.call_method("ReloadConfig", &()).await?;
+            proxy.reload_config().await?;
             info!("Configuración recargada");
         }
         Commands::Top { n } => {
-            let predictions: Vec<(String, f32)> = proxy
-                .call_method("GetTopPredictions", &n)
-                .await?
-                .body()?;
+            let predictions = proxy.get_top_predictions(n).await?;
             println!("Top {} predicciones:", n);
             for (i, (path, prob)) in predictions.iter().enumerate() {
                 println!("  {}. {} ({:.2}%)", i + 1, path, prob * 100.0);
@@ -113,12 +104,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Exe { path } => {
             let path_str = path.to_string_lossy().to_string();
-            let state: Option<ExeState> = proxy
-                .call_method("GetExeState", &path_str)
-                .await?
-                .body()?;
-            if let Some(state) = state {
-                print_exe_state(&state);
+            let state = proxy.get_exe_state(&path_str).await?;
+            if state.has_value {
+                print!("{}", format_exe_state(&state.inner));
             } else {
                 println!("Ejecutable no encontrado: {}", path_str);
             }
@@ -132,56 +120,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn print_stats(stats: &protocol::DaemonStats) {
-    println!("=== Estadísticas de vasak-preload ===");
-    println!("Estado: {:?}", stats.state);
-    println!("Escaneos: {}", stats.scan_count);
-    println!("Ejecutables rastreados: {}", stats.exe_count);
-    println!("Mapeos rastreados: {}", stats.map_count);
-    println!("Aristas de Markov: {}", stats.edge_count);
-    println!("Ejecutables activos: {}", stats.active_count);
-    println!("Tiempo de modelo: {}s", stats.model_time);
-    if let Some(tick) = &stats.last_tick {
-        println!("\n--- Último tick ---");
-        println!("Scan ID: {}", tick.scan_id);
-        println!("Exes añadidos: {}", tick.exes_added);
-        println!("Maps añadidos: {}", tick.maps_added);
-        println!("Edges añadidos: {}", tick.edges_added);
-        println!("Edges actualizados: {}", tick.edges_updated);
-        println!("Predicción exes: {}", tick.prediction_exes);
-        println!("Predicción max prob: {:.2}%", tick.prediction_max_prob * 100.0);
-        println!("Prefetch intentados: {}", tick.prefetch_attempted);
-        println!("Prefetch exitosos: {}", tick.prefetch_succeeded);
-        println!("Prefetch fallidos: {}", tick.prefetch_failed);
-        println!("Prefetch bytes: {}", tick.prefetch_bytes);
-        if let Some(pct) = tick.mem_free_pct {
-            println!("Memoria libre: {}%", pct);
+fn format_stats(stats: &DaemonStats) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "=== Estadísticas de vasak-preload ===");
+    let _ = writeln!(out, "Estado: {:?}", stats.state);
+    let _ = writeln!(out, "Escaneos: {}", stats.scan_count);
+    let _ = writeln!(out, "Ejecutables rastreados: {}", stats.exe_count);
+    let _ = writeln!(out, "Mapeos rastreados: {}", stats.map_count);
+    let _ = writeln!(out, "Aristas de Markov: {}", stats.edge_count);
+    let _ = writeln!(out, "Ejecutables activos: {}", stats.active_count);
+    let _ = writeln!(out, "Tiempo de modelo: {}s", stats.model_time);
+    // last_tick_scan_id == 0: todavía no hubo ningún tick.
+    if stats.last_tick_scan_id != 0 {
+        let _ = writeln!(out, "\n--- Último tick ---");
+        let _ = writeln!(out, "Scan ID: {}", stats.last_tick_scan_id);
+        let _ = writeln!(out, "Exes añadidos: {}", stats.last_tick_exes_added);
+        let _ = writeln!(out, "Maps añadidos: {}", stats.last_tick_maps_added);
+        let _ = writeln!(out, "Edges añadidos: {}", stats.last_tick_edges_added);
+        let _ = writeln!(out, "Edges actualizados: {}", stats.last_tick_edges_updated);
+        let _ = writeln!(out, "Predicción exes: {}", stats.last_tick_prediction_exes);
+        let _ = writeln!(
+            out,
+            "Predicción max prob: {:.2}%",
+            stats.last_tick_prediction_max_prob * 100.0
+        );
+        let _ = writeln!(
+            out,
+            "Prefetch intentados: {}",
+            stats.last_tick_prefetch_attempted
+        );
+        let _ = writeln!(
+            out,
+            "Prefetch exitosos: {}",
+            stats.last_tick_prefetch_succeeded
+        );
+        let _ = writeln!(
+            out,
+            "Prefetch fallidos: {}",
+            stats.last_tick_prefetch_failed
+        );
+        let _ = writeln!(out, "Prefetch bytes: {}", stats.last_tick_prefetch_bytes);
+        // 255: sin dato de memoria.
+        if stats.last_tick_mem_free_pct != 255 {
+            let _ = writeln!(out, "Memoria libre: {}%", stats.last_tick_mem_free_pct);
         }
     }
+    out
 }
 
-fn print_config(config: &protocol::ConfigSnapshot) {
-    println!("=== Configuración actual ===");
-    println!("Modelo ciclo: {}s", config.modelo_ciclo_secs);
-    println!("Modelo ventana activa: {}s", config.modelo_ventana_activa_secs);
-    println!("Sistema doscan: {}", config.sistema_doscan);
-    println!("Sistema dopredict: {}", config.sistema_dopredict);
-    println!("Sistema doprefetch: {}", config.sistema_doprefetch);
-    if let Some(autosave) = config.persistencia_autosave_secs {
-        println!("Autoguardado: {}s", autosave);
+fn format_config(config: &ConfigSnapshot) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "=== Configuración actual ===");
+    let _ = writeln!(out, "Modelo ciclo: {}s", config.modelo_ciclo_secs);
+    let _ = writeln!(
+        out,
+        "Modelo ventana activa: {}s",
+        config.modelo_ventana_activa_secs
+    );
+    let _ = writeln!(out, "Sistema doscan: {}", config.sistema_doscan);
+    let _ = writeln!(out, "Sistema dopredict: {}", config.sistema_dopredict);
+    let _ = writeln!(out, "Sistema doprefetch: {}", config.sistema_doprefetch);
+    // 0: autoguardado deshabilitado.
+    if config.persistencia_autosave_secs != 0 {
+        let _ = writeln!(out, "Autoguardado: {}s", config.persistencia_autosave_secs);
     } else {
-        println!("Autoguardado: deshabilitado");
+        let _ = writeln!(out, "Autoguardado: deshabilitado");
     }
+    out
 }
 
-fn print_exe_state(state: &ExeState) {
-    println!("=== Estado de ejecutable ===");
-    println!("Ruta: {}", state.path);
-    println!("Ejecutándose: {}", state.running);
-    println!("Tiempo total: {}s", state.total_running_time);
-    if let Some(last) = state.last_seen_time {
-        println!("Última vez visto: {}s", last);
+fn format_exe_state(state: &ExeState) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "=== Estado de ejecutable ===");
+    let _ = writeln!(out, "Ruta: {}", state.path);
+    let _ = writeln!(out, "Ejecutándose: {}", state.running);
+    let _ = writeln!(out, "Tiempo total: {}s", state.total_running_time);
+    // 0: nunca visto.
+    if state.last_seen_time != 0 {
+        let _ = writeln!(out, "Última vez visto: {}s", state.last_seen_time);
     }
-    println!("Probabilidad predicción: {:.2}%", state.prediction_probability * 100.0);
-    println!("Mapeos: {}", state.map_count);
+    let _ = writeln!(
+        out,
+        "Probabilidad predicción: {:.2}%",
+        state.prediction_probability * 100.0
+    );
+    let _ = writeln!(out, "Mapeos: {}", state.map_count);
+    out
 }

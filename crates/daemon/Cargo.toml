@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 vasak-preload-config = { path = "../config", package = "vasak-preload-config" }
-orchestrator = { path = "../orchestrator", package = "vasak-preload-orchestrator" }
+vasak-preload-orchestrator = { path = "../orchestrator" }
 vasak-preload-protocol = { path = "../protocol", package = "vasak-preload-protocol" }
 serde.workspace = true
 serde_json.workspace = true
@@ -25,3 +25,6 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 dirs.workspace = true
 toml_edit.workspace = true
+[dev-dependencies]
+tempfile.workspace = true
+zbus = { workspace = true, features = ["p2p"] }

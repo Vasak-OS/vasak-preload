@@ -3,11 +3,12 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use zvariant::Type;
+use zvariant::{OwnedValue, Type, Value};
 
 /// Estado del daemon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, Value, OwnedValue)]
 #[zvariant(signature = "u")]
+#[repr(u32)]
 pub enum DaemonState {
     /// Iniciando.
     Starting = 0,
@@ -26,7 +27,7 @@ impl Default for DaemonState {
 }
 
 /// Estadísticas del daemon.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Value, OwnedValue)]
 pub struct DaemonStats {
     /// Estado actual.
     pub state: DaemonState,
@@ -49,7 +50,7 @@ pub struct DaemonStats {
     pub last_tick_edges_added: u32,
     pub last_tick_edges_updated: u32,
     pub last_tick_prediction_exes: u32,
-    pub last_tick_prediction_max_prob: f32,
+    pub last_tick_prediction_max_prob: f64,
     pub last_tick_prefetch_attempted: u32,
     pub last_tick_prefetch_succeeded: u32,
     pub last_tick_prefetch_failed: u32,
@@ -84,7 +85,7 @@ impl Default for DaemonStats {
 }
 
 /// Configuración expuesta via D-Bus.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Value, OwnedValue)]
 pub struct ConfigSnapshot {
     pub modelo_ciclo_secs: u64,
     pub modelo_ventana_activa_secs: u64,
