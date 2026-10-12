@@ -1,0 +1,30 @@
+# Los chequeos viven en el repositorio `.github` de la organización, así que
+# acá sólo se los llama. Cambiarlos es cambiarlos en un solo lugar.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  app:
+    # Sólo lectura: el flujo llamado declara lo mismo en su trabajo; se repite
+    # acá porque el análisis estático de este repositorio no ve el otro archivo.
+    permissions:
+      contents: read
+    uses: Vasak-OS/.github/.github/workflows/app.yml@main
+    with:
+      # Los cinco crates del workspace. Ninguno depende de Tauri, así que
+      # compilan en un runner pelado. Un crate que no figure acá no corre sus
+      # pruebas en el CI y figura con cobertura cero en Sonar.
+      pruebas_rust: >-
+        -p vasak-preload-config
+        -p vasak-preload-orchestrator
+        -p vasak-preload-protocol
+        -p vasak-preload-daemon
+        -p vasak-preload-cli
+    # Sólo el token de SonarQube Cloud, y por nombre: `secrets: inherit` le
+    # daría también otros tokens a un trabajo que instala dependencias.
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

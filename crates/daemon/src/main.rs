@@ -4,28 +4,29 @@
 
 #![forbid(unsafe_code)]
 
-use vasak_preload_config::Config;
-use vasak_preload_orchestrator::{
-    clock::SystemClock, observation::DefaultAdmissionPolicy, observation::DefaultModelUpdater,
-    observation::ProcfsScanner, persistence::SqliteRepository, prediction::MarkovPredictor,
-    prefetch::GreedyPrefetchPlanner, prefetch::NoopPrefetcher, engine::{ControlEvent, PreloadEngine, ReloadBundle, Services},
-};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, RwLock};
-use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
-use zbus::{connection, zvariant::OwnedObjectPath};
+use tokio::signal::unix::{SignalKind, signal};
+use tracing::info;
+use vasak_preload_config::Config;
+use zbus::{Connection, connection};
 
 mod service;
+#[cfg(test)]
+mod tests;
 
-use crate::service::PreloadService;
+const BUS_NAME: &str = "org.vasakos.Preload";
+const OBJECT_PATH: &str = "/org/vasakos/Preload";
+
+use crate::service::{ConfigSource, EngineTask, PreloadService};
 use clap::Parser;
 
 /// Argumentos de línea de comandos.
 #[derive(Parser, Debug)]
-#[command(name = "vasak-preload", version, about = "VasakOS system optimizer: prefetches binaries based on usage patterns")]
+#[command(
+    name = "vasak-preload",
+    version,
+    about = "VasakOS system optimizer: prefetches binaries based on usage patterns"
+)]
 struct Args {
     /// Archivo de configuración.
     #[arg(short, long, value_name = "FILE")]
@@ -34,10 +35,6 @@ struct Args {
     /// Directorio de configuración (se cargan todos los *.toml).
     #[arg(long, value_name = "DIR")]
     config_dir: Option<PathBuf>,
-
-    /// Ejecutar en primer plano (no hacer daemonize).
-    #[arg(short, long)]
-    foreground: bool,
 
     /// Imprimir configuración efectiva y salir.
     #[arg(long)]
@@ -61,7 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Cargar configuración
-    let config = load_config(&args)?;
+    let source = config_source(&args);
+    let config = source
+        .load()
+        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
     if args.print_config {
         println!("{}", toml_edit::ser::to_string_pretty(&config)?);
@@ -75,81 +75,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Iniciando vasak-preload");
 
-    // Crear conexión D-Bus
-    let conn = connection::Builder::system()?
-        .name("org.vasakos.Preload")?
-        .serve_at("/org/vasakos/Preload", PreloadService::new(config.clone()).await?)?
-        .build()
+    // Publicar el servicio en el bus del sistema. Si el nombre no se puede
+    // tomar, el motor no llega a arrancar.
+    run(
+        connection::Builder::system()?.name(BUS_NAME)?,
+        config,
+        source,
+        wait_for_shutdown(),
+    )
+    .await
+}
+
+/// Publica el servicio, lo atiende hasta que termina `shutdown` y apaga el
+/// motor (con su guardado final) antes de volver.
+async fn run(
+    builder: connection::Builder<'_>,
+    config: Config,
+    source: ConfigSource,
+    shutdown: impl Future<Output = std::io::Result<()>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_conn, engine) = serve(builder, PreloadService::new(config, source).await?).await?;
+    info!("Servicio publicado");
+
+    let result = shutdown.await;
+    info!("Apagando");
+    engine.shutdown().await;
+
+    Ok(result?)
+}
+
+/// Publica el servicio en la conexión que arma `builder` y arranca el motor
+/// sobre esa misma instancia, para que la interfaz D-Bus vea el motor que corre.
+async fn serve(
+    builder: connection::Builder<'_>,
+    service: PreloadService,
+) -> Result<(Connection, EngineTask), Box<dyn std::error::Error>> {
+    let conn = builder.serve_at(OBJECT_PATH, service)?.build().await?;
+
+    let engine = conn
+        .object_server()
+        .interface::<_, PreloadService>(OBJECT_PATH)
+        .await?
+        .get()
+        .await
+        .start_engine()
         .await?;
 
-    info!("Conectado al bus del sistema");
-
-    // Ejecutar el daemon
-    if args.foreground {
-        run_foreground(conn, config).await?
-    } else {
-        run_daemon(conn, config).await?
-    }
-
-    Ok(())
+    Ok((conn, engine))
 }
 
-/// Carga la configuración desde archivos.
-fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> {
+/// De dónde leer la configuración según los argumentos.
+fn config_source(args: &Args) -> ConfigSource {
     if let Some(config_file) = &args.config {
-        return Ok(Config::cargar(config_file)?);
+        ConfigSource::File(config_file.clone())
+    } else if let Some(config_dir) = &args.config_dir {
+        ConfigSource::Dir(config_dir.clone())
+    } else {
+        ConfigSource::Default
     }
-
-    if let Some(config_dir) = &args.config_dir {
-        let mut paths = Vec::new();
-        for entry in std::fs::read_dir(config_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "toml") {
-                paths.push(path);
-            }
-        }
-        paths.sort();
-        return Ok(Config::cargar_multiple(paths)?);
-    }
-
-    // Rutas por defecto
-    let default_paths = vec![
-        PathBuf::from("/etc/vasak-preload/config.toml"),
-        dirs::config_dir()
-            .map(|d| d.join("vasak-preload/config.toml"))
-            .unwrap_or_default(),
-    ];
-
-    Ok(Config::cargar_multiple(default_paths)?)
 }
 
-/// Ejecuta en primer plano (para testing/systemd).
-async fn run_foreground(
-    conn: connection::Connection,
-    config: Config,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let service = PreloadService::new(config).await?;
-    let service = Arc::new(service);
-
-    // Iniciar motor en background
-    let engine_handle = service.start_engine().await?;
-
-    // Mantener conexión viva
-    let mut signals = conn.try_listen().await?;
-    while signals.next().await.is_some() {}
-
-    // Apagar
-    engine_handle.cancel().await;
+/// Espera SIGTERM (systemd) o SIGINT (Ctrl+C).
+async fn wait_for_shutdown() -> std::io::Result<()> {
+    let mut sigterm = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        result = tokio::signal::ctrl_c() => result?,
+    }
     Ok(())
-}
-
-/// Ejecuta como daemon (fork + setsid).
-async fn run_daemon(
-    conn: connection::Connection,
-    config: Config,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // En Linux, systemd maneja el daemonizing. Si no estamos bajo systemd,
-    // podríamos hacer fork manual, pero por simplicidad asumimos systemd.
-    run_foreground(conn, config).await
 }

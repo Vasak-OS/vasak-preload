@@ -2619,7 +2619,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vasak-preload-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "dirs",
@@ -2628,15 +2628,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "vasak-preload-config",
- "vasak-preload-orchestrator",
  "vasak-preload-protocol",
  "zbus",
 ]
 
 [[package]]
 name = "vasak-preload-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dirs",
  "proptest",
@@ -2649,12 +2647,14 @@ dependencies = [
 
 [[package]]
 name = "vasak-preload-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "dirs",
+ "nix",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "toml_edit",
@@ -2668,7 +2668,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-preload-orchestrator"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -2691,7 +2691,7 @@ dependencies = [
 
 [[package]]
 name = "vasak-preload-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",

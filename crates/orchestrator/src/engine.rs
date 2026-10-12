@@ -102,7 +102,10 @@ impl PreloadEngine {
             self.services.scanner.scan(now, self.scan_id)?
         } else {
             vec![
-                ObservationEvent::ObsBegin { time: now, scan_id: self.scan_id },
+                ObservationEvent::ObsBegin {
+                    time: now,
+                    scan_id: self.scan_id,
+                },
                 ObservationEvent::ObsEnd {
                     time: now,
                     scan_id: self.scan_id,
@@ -370,7 +373,12 @@ impl PreloadEngine {
         };
 
         for map in snapshot.state.maps {
-            let segment = MapSegment::new(PathBuf::from(map.path), map.offset, map.length, map.update_time);
+            let segment = MapSegment::new(
+                PathBuf::from(map.path),
+                map.offset,
+                map.length,
+                map.update_time,
+            );
             stores.ensure_map(segment);
         }
 
@@ -402,7 +410,11 @@ impl PreloadEngine {
             let map_id = stores
                 .maps
                 .iter()
-                .find(|(_, m)| m.path.to_string_lossy() == record.map_path && m.offset == record.map_offset && m.length == record.map_length)
+                .find(|(_, m)| {
+                    m.path.to_string_lossy() == record.map_path
+                        && m.offset == record.map_offset
+                        && m.length == record.map_length
+                })
                 .map(|(id, _)| id)
                 .ok_or_else(|| Error::MapMissing(PathBuf::from(record.map_path.clone())))?;
             stores.attach_map(exe_id, map_id);
@@ -444,10 +456,13 @@ mod tests {
     use crate::config::{Config, Modelo, Persistencia, Sistema};
     use crate::domain::{ExeKey, MapKey, MapSegment, MarkovState, MemStat};
     use crate::observation::{AdmissionDecision, AdmissionPolicy, CandidateExe, Completeness};
+    use crate::observation::{DefaultAdmissionPolicy, DefaultModelUpdater};
     use crate::observation::{ModelUpdater, Observation, ObservationEvent, Scanner};
     use crate::persistence::NoopRepository;
     use crate::prediction::{Prediction, Predictor};
-    use crate::prefetch::{PrefetchPlan, PrefetchPlanner, PrefetchReport, Prefetcher};
+    use crate::prefetch::{
+        NoopPrefetcher, PrefetchPlan, PrefetchPlanner, PrefetchReport, Prefetcher,
+    };
     use crate::stores::EdgeKey;
     use async_trait::async_trait;
     use proptest::prelude::*;
@@ -665,7 +680,116 @@ mod tests {
         let mut engine = PreloadEngine::new(config, services).await.unwrap();
         engine.tick().await.unwrap();
 
-        // Verificar que el tiempo avanzó
-        assert_eq!(engine.stores.model_time, 1001);
+        // El tiempo del modelo es lógico: avanza un ciclo por tick, sin mirar
+        // el reloj (que sólo se usa para dormir entre ticks).
+        assert_eq!(engine.stores.model_time, 1);
+    }
+
+    /// Servicios para un motor que sólo se guarda y se carga: nada escanea.
+    fn servicios_con_repo(repo: crate::persistence::SqliteRepository) -> Services {
+        Services {
+            scanner: Box::new(StaticScanner),
+            admission: Box::new(DefaultAdmissionPolicy::new(vec![], vec![], 100_000_000)),
+            updater: Box::new(DefaultModelUpdater::new()),
+            predictor: Box::new(crate::prediction::MarkovPredictor::new()),
+            planner: Box::new(crate::prefetch::GreedyPrefetchPlanner::new()),
+            prefetcher: Box::new(NoopPrefetcher),
+            repo: Box::new(repo),
+            clock: Box::new(crate::clock::SystemClock),
+        }
+    }
+
+    /// Lo que importa de los almacenes, sin los ids (que cambian al cargar):
+    /// cada ejecutable con sus tiempos y los mapas que tiene enganchados.
+    fn ejecutables_con_mapas(
+        stores: &Stores,
+    ) -> Vec<(String, u64, Option<u64>, Vec<(String, u64, u64, u64)>)> {
+        let mut resultado: Vec<_> = stores
+            .exes
+            .iter()
+            .map(|(exe_id, exe)| {
+                let mut mapas: Vec<_> = stores
+                    .exe_maps
+                    .maps_for_exe(exe_id)
+                    .into_iter()
+                    .map(|map_id| {
+                        let mapa = stores.maps.get(map_id).expect("mapa enganchado existe");
+                        (
+                            mapa.path.to_string_lossy().into_owned(),
+                            mapa.offset,
+                            mapa.length,
+                            mapa.update_time,
+                        )
+                    })
+                    .collect();
+                mapas.sort();
+                (
+                    exe.key.path().to_string_lossy().into_owned(),
+                    exe.total_running_time,
+                    exe.last_seen_time,
+                    mapas,
+                )
+            })
+            .collect();
+        resultado.sort();
+        resultado
+    }
+
+    #[tokio::test]
+    async fn guardar_y_cargar_conserva_ejecutables_mapas_y_sus_enganches() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ruta = dir.path().join("state.sqlite");
+        let config = Config::default();
+
+        let repo = crate::persistence::SqliteRepository::new(&ruta)
+            .await
+            .unwrap();
+        let mut original = PreloadEngine::new(config.clone(), servicios_con_repo(repo))
+            .await
+            .unwrap();
+        {
+            let stores = &mut original.stores;
+            stores.model_time = 500;
+            let bash = stores.ensure_exe(ExeKey::new("/usr/bin/bash".into()));
+            let vim = stores.ensure_exe(ExeKey::new("/usr/bin/vim".into()));
+            let _sin_mapas = stores.ensure_exe(ExeKey::new("/usr/bin/true".into()));
+            stores.exes.get_mut(bash).unwrap().total_running_time = 40;
+            stores.exes.get_mut(bash).unwrap().last_seen_time = Some(490);
+            stores.exes.get_mut(vim).unwrap().total_running_time = 7;
+
+            // Segmentos que difieren de `libc_a` en un solo campo (offset,
+            // longitud o ruta): el reenganche tiene que mirar los tres. Se
+            // crean después de `libc_a` para que una búsqueda que ignore un
+            // campo encuentre `libc_a` primero y enganche el equivocado.
+            let libc_a =
+                stores.ensure_map(MapSegment::new("/usr/lib/libc.so.6".into(), 0, 4096, 11));
+            let otro_offset =
+                stores.ensure_map(MapSegment::new("/usr/lib/libc.so.6".into(), 4096, 4096, 12));
+            let otra_longitud =
+                stores.ensure_map(MapSegment::new("/usr/lib/libc.so.6".into(), 0, 8192, 13));
+            let otra_ruta = stores.ensure_map(MapSegment::new(
+                "/usr/lib/libncursesw.so.6".into(),
+                0,
+                4096,
+                14,
+            ));
+            stores.attach_map(bash, libc_a);
+            stores.attach_map(vim, otro_offset);
+            stores.attach_map(vim, otra_longitud);
+            stores.attach_map(vim, otra_ruta);
+        }
+        original.save().await.unwrap();
+        let esperado = ejecutables_con_mapas(&original.stores);
+
+        let repo = crate::persistence::SqliteRepository::new(&ruta)
+            .await
+            .unwrap();
+        let cargado = PreloadEngine::load(config, servicios_con_repo(repo))
+            .await
+            .unwrap();
+
+        assert_eq!(cargado.stores.model_time, 500);
+        assert_eq!(cargado.stores.maps.len(), 4);
+        assert_eq!(ejecutables_con_mapas(&cargado.stores), esperado);
     }
 }
