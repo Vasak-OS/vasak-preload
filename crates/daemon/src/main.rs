@@ -17,7 +17,7 @@ mod tests;
 const BUS_NAME: &str = "org.vasakos.Preload";
 const OBJECT_PATH: &str = "/org/vasakos/Preload";
 
-use crate::service::{EngineTask, PreloadService, default_config_paths};
+use crate::service::{ConfigSource, EngineTask, PreloadService};
 use clap::Parser;
 
 /// Argumentos de línea de comandos.
@@ -58,7 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Cargar configuración
-    let config = load_config(&args)?;
+    let source = config_source(&args);
+    let config = source
+        .load()
+        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
     if args.print_config {
         println!("{}", toml_edit::ser::to_string_pretty(&config)?);
@@ -77,6 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     run(
         connection::Builder::system()?.name(BUS_NAME)?,
         config,
+        source,
         wait_for_shutdown(),
     )
     .await
@@ -87,9 +91,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run(
     builder: connection::Builder<'_>,
     config: Config,
+    source: ConfigSource,
     shutdown: impl Future<Output = std::io::Result<()>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_conn, engine) = serve(builder, PreloadService::new(config).await?).await?;
+    let (_conn, engine) = serve(builder, PreloadService::new(config, source).await?).await?;
     info!("Servicio publicado");
 
     let result = shutdown.await;
@@ -119,27 +124,15 @@ async fn serve(
     Ok((conn, engine))
 }
 
-/// Carga la configuración desde archivos.
-fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> {
+/// De dónde leer la configuración según los argumentos.
+fn config_source(args: &Args) -> ConfigSource {
     if let Some(config_file) = &args.config {
-        return Ok(Config::cargar(config_file)?);
+        ConfigSource::File(config_file.clone())
+    } else if let Some(config_dir) = &args.config_dir {
+        ConfigSource::Dir(config_dir.clone())
+    } else {
+        ConfigSource::Default
     }
-
-    if let Some(config_dir) = &args.config_dir {
-        let mut paths = Vec::new();
-        for entry in std::fs::read_dir(config_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "toml") {
-                paths.push(path);
-            }
-        }
-        paths.sort();
-        return Ok(Config::cargar_multiple(paths)?);
-    }
-
-    // Rutas por defecto
-    Ok(Config::cargar_multiple(default_config_paths())?)
 }
 
 /// Espera SIGTERM (systemd) o SIGINT (Ctrl+C).

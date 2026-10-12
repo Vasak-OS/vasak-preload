@@ -38,38 +38,62 @@ pub struct PreloadService {
     control_tx: Mutex<Option<mpsc::UnboundedSender<ControlEvent>>>,
     stores: Arc<RwLock<Stores>>,
     stats: Arc<Mutex<DaemonStats>>,
-    /// Archivos que lee `ReloadConfig`, en orden.
-    reload_paths: Vec<PathBuf>,
+    /// De dónde sale la configuración: `ReloadConfig` la vuelve a leer del
+    /// mismo lugar que el arranque.
+    config_source: ConfigSource,
 }
 
-/// Archivos de configuración por omisión: el del sistema y el del usuario.
-pub fn default_config_paths() -> Vec<PathBuf> {
-    vec![
-        PathBuf::from("/etc/vasak-preload/config.toml"),
-        dirs::config_dir()
-            .map(|d| d.join("vasak-preload/config.toml"))
-            .unwrap_or_default(),
-    ]
+/// De dónde se lee la configuración.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// Un único archivo (`--config`). Si falta, es un error.
+    File(PathBuf),
+    /// Todos los `*.toml` de un directorio, en orden alfabético (`--config-dir`).
+    /// Se vuelve a leer el directorio en cada carga.
+    Dir(PathBuf),
+    /// El archivo del sistema y el del usuario, los que existan.
+    Default,
+}
+
+impl ConfigSource {
+    /// Lee la configuración de esta fuente.
+    pub fn load(&self) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            ConfigSource::File(path) => Ok(Config::cargar(path)?),
+            ConfigSource::Dir(dir) => {
+                let mut paths = Vec::new();
+                for entry in std::fs::read_dir(dir)? {
+                    let path = entry?.path();
+                    if path.extension().is_some_and(|ext| ext == "toml") {
+                        paths.push(path);
+                    }
+                }
+                paths.sort();
+                Ok(Config::cargar_multiple(paths)?)
+            }
+            ConfigSource::Default => Ok(Config::cargar_multiple([
+                PathBuf::from("/etc/vasak-preload/config.toml"),
+                dirs::config_dir()
+                    .map(|d| d.join("vasak-preload/config.toml"))
+                    .unwrap_or_default(),
+            ])?),
+        }
+    }
 }
 
 impl PreloadService {
     /// Crea un nuevo servicio. El motor se arranca aparte, con `start_engine`.
-    pub async fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(
+        config: Config,
+        config_source: ConfigSource,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             config: RwLock::new(config),
             control_tx: Mutex::new(None),
             stores: Arc::new(RwLock::new(Stores::default())),
             stats: Arc::new(Mutex::new(DaemonStats::default())),
-            reload_paths: default_config_paths(),
+            config_source,
         })
-    }
-
-    /// Cambia los archivos que lee `ReloadConfig` (las pruebas los apuntan a
-    /// un directorio temporal para no depender de la máquina).
-    #[cfg(test)]
-    pub fn with_reload_paths(mut self, paths: Vec<PathBuf>) -> Self {
-        self.reload_paths = paths;
-        self
     }
 
     /// Inicia el motor en background.
@@ -217,7 +241,9 @@ impl PreloadService {
     }
 
     async fn reload_config(&self) -> zbus::fdo::Result<()> {
-        let new_config = Config::cargar_multiple(self.reload_paths.clone())
+        let new_config = self
+            .config_source
+            .load()
             .map_err(|e| FdoError::Failed(format!("configuración inválida: {e}")))?;
 
         let bundle = ReloadBundle {

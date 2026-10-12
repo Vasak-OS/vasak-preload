@@ -4,8 +4,9 @@
 //! modo peer-to-peer: no hace falta bus del sistema ni root. El cliente usa el
 //! mismo `PreloadProxy` que `vasak-preload-cli`.
 
-use crate::service::{EngineTask, PreloadService};
-use crate::{OBJECT_PATH, run, serve, wait_for_shutdown};
+use crate::service::{ConfigSource, EngineTask, PreloadService};
+use crate::{Args, OBJECT_PATH, config_source, run, serve, wait_for_shutdown};
+use clap::Parser;
 use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -52,7 +53,12 @@ struct Daemon {
 /// Publica el daemon con `serve` —lo mismo que hace `main` sobre el bus del
 /// sistema— en un extremo del par, y conecta el proxy en el otro.
 async fn start_daemon(config: Config) -> Daemon {
-    start_daemon_with(PreloadService::new(config).await.expect("servicio")).await
+    start_daemon_with(
+        PreloadService::new(config, ConfigSource::Default)
+            .await
+            .expect("servicio"),
+    )
+    .await
 }
 
 /// Como `start_daemon`, con un servicio ya armado (por ejemplo, con otros archivos
@@ -90,7 +96,9 @@ async fn start_daemon_with(service: PreloadService) -> Daemon {
 async fn publicar_sin_motor(config: Config) -> (Connection, Connection, PreloadProxy<'static>) {
     let (lado_servidor, lado_cliente) = UnixStream::pair().expect("par de sockets");
 
-    let servicio = PreloadService::new(config).await.expect("servicio");
+    let servicio = PreloadService::new(config, ConfigSource::Default)
+        .await
+        .expect("servicio");
     let servidor = connection::Builder::unix_stream(lado_servidor)
         .server(Guid::generate())
         .expect("guid")
@@ -415,7 +423,7 @@ async fn correr_hasta_el_apagado(
     let (senal, apagado) = tokio::sync::oneshot::channel();
 
     let daemon = async {
-        run(servidor, config, async {
+        run(servidor, config, ConfigSource::Default, async {
             apagado.await.expect("emisor vivo")
         })
         .await
@@ -508,16 +516,15 @@ async fn sigterm_y_sigint_terminan_la_espera_de_apagado() {
 
 #[tokio::test]
 async fn recargar_con_el_motor_corriendo_reemplaza_la_configuracion() {
-    // `ReloadConfig` lee archivos que no existen dentro del directorio
-    // temporal, así que carga los valores por omisión, que no traen 4321. No
+    // `ReloadConfig` lee los `*.toml` del directorio temporal, que no tiene
+    // ninguno, así que carga los valores por omisión, que no traen 4321. No
     // depende de la configuración de la máquina.
     let dir = TempDir::new().unwrap();
     let mut config = config_de_prueba(dir.path());
     config.modelo.ventana_activa = Duration::from_secs(4321);
-    let service = PreloadService::new(config)
+    let service = PreloadService::new(config, ConfigSource::Dir(dir.path().to_path_buf()))
         .await
-        .expect("servicio")
-        .with_reload_paths(vec![dir.path().join("no-existe.toml")]);
+        .expect("servicio");
     let daemon = start_daemon_with(service).await;
 
     daemon.proxy.reload_config().await.unwrap();
@@ -532,4 +539,133 @@ async fn recargar_con_el_motor_corriendo_reemplaza_la_configuracion() {
     );
 
     apagar(daemon.motor).await;
+}
+
+/// Escribe en `path` una configuración que no depende de la máquina (sin
+/// escaneo, predicción ni prefetch; estado en `state_dir`) con la
+/// `ventana_activa` pedida.
+fn write_config(path: &Path, state_dir: &Path, ventana_activa: u64) {
+    let estado = state_dir.join("state.sqlite");
+    std::fs::write(
+        path,
+        format!(
+            "[modelo]\nciclo = 1\nventana_activa = {ventana_activa}\n\
+             [sistema]\ndoscan = false\ndopredict = false\ndoprefetch = false\n\
+             [persistencia]\nestado_path = {estado:?}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Arranca el daemon como `main`: lee la configuración de `source` y le pasa
+/// la misma fuente al servicio para las recargas.
+async fn start_daemon_from(source: ConfigSource) -> Daemon {
+    let config = source.load().expect("configuración inicial");
+    start_daemon_with(PreloadService::new(config, source).await.expect("servicio")).await
+}
+
+async fn published_window(daemon: &Daemon) -> u64 {
+    daemon
+        .proxy
+        .config()
+        .await
+        .unwrap()
+        .modelo_ventana_activa_secs
+}
+
+#[tokio::test]
+async fn recargar_relee_el_archivo_elegido_con_config() {
+    let dir = TempDir::new().unwrap();
+    let archivo = dir.path().join("elegido.toml");
+    write_config(&archivo, dir.path(), 111);
+    let daemon = start_daemon_from(ConfigSource::File(archivo.clone())).await;
+    assert_eq!(published_window(&daemon).await, 111);
+
+    // Quien arrancó con `--config` edita ese archivo y pide recargar: tiene
+    // que verse lo que escribió, no lo de `/etc` ni lo del usuario.
+    write_config(&archivo, dir.path(), 222);
+    daemon.proxy.reload_config().await.unwrap();
+    assert_eq!(published_window(&daemon).await, 222);
+
+    apagar(daemon.motor).await;
+}
+
+#[tokio::test]
+async fn recargar_relee_el_directorio_y_el_orden_alfabetico_decide() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("conf.d");
+    std::fs::create_dir(&conf).unwrap();
+    write_config(&conf.join("10-base.toml"), dir.path(), 111);
+    let daemon = start_daemon_from(ConfigSource::Dir(conf.clone())).await;
+    assert_eq!(published_window(&daemon).await, 111);
+
+    // Dos archivos nuevos, uno antes y otro después de `10-base` en orden
+    // alfabético. El de antes queda pisado; el de después pisa.
+    std::fs::write(
+        conf.join("05-antes.toml"),
+        "[modelo]\nciclo = 7\nventana_activa = 999\n",
+    )
+    .unwrap();
+    std::fs::write(
+        conf.join("20-despues.toml"),
+        "[modelo]\nventana_activa = 222\n[persistencia]\nautosave_interval = 42\n",
+    )
+    .unwrap();
+    // Lo que no termina en `.toml` no se lee.
+    std::fs::write(conf.join("99-notas.txt"), "[modelo]\nventana_activa = 5\n").unwrap();
+
+    daemon.proxy.reload_config().await.unwrap();
+    let config = daemon.proxy.config().await.unwrap();
+    assert_eq!(config.modelo_ventana_activa_secs, 222);
+    assert_eq!(config.modelo_ciclo_secs, 1, "10-base pisa a 05-antes");
+    assert_eq!(config.persistencia_autosave_secs, 42);
+
+    apagar(daemon.motor).await;
+}
+
+#[tokio::test]
+async fn sin_el_archivo_elegido_la_recarga_falla_y_no_vuelve_a_los_valores_por_omision() {
+    let dir = TempDir::new().unwrap();
+    let archivo = dir.path().join("elegido.toml");
+    write_config(&archivo, dir.path(), 111);
+    let daemon = start_daemon_from(ConfigSource::File(archivo.clone())).await;
+
+    std::fs::remove_file(&archivo).unwrap();
+    let error = daemon.proxy.reload_config().await.unwrap_err();
+    assert!(
+        es_failed(&error),
+        "se esperaba Error.Failed, llegó {error:?}"
+    );
+    assert_eq!(published_window(&daemon).await, 111);
+
+    apagar(daemon.motor).await;
+}
+
+fn source_from(args: &[&str]) -> ConfigSource {
+    let args = Args::try_parse_from(std::iter::once("vasak-preload").chain(args.iter().copied()))
+        .expect("argumentos válidos");
+    config_source(&args)
+}
+
+#[test]
+fn los_argumentos_eligen_de_donde_se_lee_la_configuracion() {
+    assert_eq!(
+        source_from(&["--config", "/srv/preload.toml"]),
+        ConfigSource::File("/srv/preload.toml".into())
+    );
+    assert_eq!(
+        source_from(&["--config-dir", "/srv/preload.d"]),
+        ConfigSource::Dir("/srv/preload.d".into())
+    );
+    assert_eq!(source_from(&[]), ConfigSource::Default);
+    // Con los dos, manda el archivo, como antes en `load_config`.
+    assert_eq!(
+        source_from(&[
+            "--config-dir",
+            "/srv/preload.d",
+            "--config",
+            "/srv/preload.toml"
+        ]),
+        ConfigSource::File("/srv/preload.toml".into())
+    );
 }
