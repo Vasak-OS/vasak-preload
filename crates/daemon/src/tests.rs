@@ -51,7 +51,13 @@ struct Daemon {
 
 /// Publica el daemon con `serve` —lo mismo que hace `main` sobre el bus del
 /// sistema— en un extremo del par, y conecta el proxy en el otro.
-async fn levantar(config: Config) -> Daemon {
+async fn start_daemon(config: Config) -> Daemon {
+    start_daemon_with(PreloadService::new(config).await.expect("servicio")).await
+}
+
+/// Como `start_daemon`, con un servicio ya armado (por ejemplo, con otros archivos
+/// de configuración para `ReloadConfig`).
+async fn start_daemon_with(service: PreloadService) -> Daemon {
     let (lado_servidor, lado_cliente) = UnixStream::pair().expect("par de sockets");
 
     let servidor = connection::Builder::unix_stream(lado_servidor)
@@ -60,7 +66,7 @@ async fn levantar(config: Config) -> Daemon {
         .p2p();
     let cliente = connection::Builder::unix_stream(lado_cliente).p2p().build();
 
-    let (servido, cliente) = tokio::join!(serve(servidor, config), cliente);
+    let (servido, cliente) = tokio::join!(serve(servidor, service), cliente);
     let (servidor, motor) = servido.expect("publicar el servicio y arrancar el motor");
     let cliente = cliente.expect("conectar el cliente");
 
@@ -136,7 +142,7 @@ async fn apagar(motor: EngineTask) {
 #[tokio::test]
 async fn la_interfaz_publicada_ve_el_motor_que_corre() {
     let dir = TempDir::new().unwrap();
-    let daemon = levantar(config_de_prueba(dir.path())).await;
+    let daemon = start_daemon(config_de_prueba(dir.path())).await;
 
     // Con dos instancias del servicio (una publicada, otra con el motor), la
     // publicada se quedaba en `Starting` para siempre.
@@ -152,7 +158,7 @@ async fn la_interfaz_publicada_ve_el_motor_que_corre() {
 #[tokio::test]
 async fn las_estadisticas_llegan_por_d_bus_con_sus_valores_de_ausencia() {
     let dir = TempDir::new().unwrap();
-    let daemon = levantar(config_de_prueba(dir.path())).await;
+    let daemon = start_daemon(config_de_prueba(dir.path())).await;
 
     let stats = daemon.proxy.stats().await.unwrap();
     assert_eq!(stats.last_tick_scan_id, 0, "0 = todavía sin ticks");
@@ -172,7 +178,7 @@ async fn la_configuracion_llega_por_d_bus() {
     config.modelo.ventana_activa = Duration::from_secs(1234);
     config.sistema.dopredict = true;
     config.persistencia.autosave_interval = Some(Duration::from_secs(42));
-    let daemon = levantar(config).await;
+    let daemon = start_daemon(config).await;
 
     let snapshot = daemon.proxy.config().await.unwrap();
     assert_eq!(snapshot.modelo_ciclo_secs, 1);
@@ -195,7 +201,7 @@ async fn sin_intervalo_propio_la_configuracion_informa_el_autoguardado_del_siste
     let mut config = config_de_prueba(dir.path());
     config.persistencia.autosave_interval = None;
     config.sistema.autosave = Duration::from_secs(300);
-    let daemon = levantar(config).await;
+    let daemon = start_daemon(config).await;
 
     let snapshot = daemon.proxy.config().await.unwrap();
     assert_eq!(snapshot.persistencia_autosave_secs, 300);
@@ -206,7 +212,7 @@ async fn sin_intervalo_propio_la_configuracion_informa_el_autoguardado_del_siste
 #[tokio::test]
 async fn un_ejecutable_desconocido_vuelve_sin_valor() {
     let dir = TempDir::new().unwrap();
-    let daemon = levantar(config_de_prueba(dir.path())).await;
+    let daemon = start_daemon(config_de_prueba(dir.path())).await;
 
     let estado = daemon
         .proxy
@@ -222,7 +228,7 @@ async fn un_ejecutable_desconocido_vuelve_sin_valor() {
 #[tokio::test]
 async fn pausar_y_reanudar_se_ven_en_el_estado() {
     let dir = TempDir::new().unwrap();
-    let daemon = levantar(config_de_prueba(dir.path())).await;
+    let daemon = start_daemon(config_de_prueba(dir.path())).await;
 
     daemon.proxy.pause().await.unwrap();
     assert_eq!(daemon.proxy.state().await.unwrap(), DaemonState::Paused);
@@ -239,7 +245,7 @@ async fn guardar_ahora_persiste_el_estado_del_motor() {
     let repo = SqliteRepository::new(&config.persistencia.estado_path)
         .await
         .unwrap();
-    let daemon = levantar(config).await;
+    let daemon = start_daemon(config).await;
     marcar(&repo).await;
 
     daemon.proxy.save_now().await.unwrap();
@@ -264,7 +270,7 @@ async fn el_apagado_termina_el_motor_y_guarda() {
     let repo = SqliteRepository::new(&config.persistencia.estado_path)
         .await
         .unwrap();
-    let daemon = levantar(config).await;
+    let daemon = start_daemon(config).await;
     marcar(&repo).await;
 
     apagar(daemon.motor).await;
@@ -502,13 +508,17 @@ async fn sigterm_y_sigint_terminan_la_espera_de_apagado() {
 
 #[tokio::test]
 async fn recargar_con_el_motor_corriendo_reemplaza_la_configuracion() {
-    // Depende de la máquina: `ReloadConfig` lee `/etc/vasak-preload/config.toml`
-    // y la del usuario. Sin ellas (el runner del CI) carga los valores por
-    // omisión; con una válida, la suya. En ningún caso trae 4321.
+    // `ReloadConfig` lee archivos que no existen dentro del directorio
+    // temporal, así que carga los valores por omisión, que no traen 4321. No
+    // depende de la configuración de la máquina.
     let dir = TempDir::new().unwrap();
     let mut config = config_de_prueba(dir.path());
     config.modelo.ventana_activa = Duration::from_secs(4321);
-    let daemon = levantar(config).await;
+    let service = PreloadService::new(config)
+        .await
+        .expect("servicio")
+        .with_reload_paths(vec![dir.path().join("no-existe.toml")]);
+    let daemon = start_daemon_with(service).await;
 
     daemon.proxy.reload_config().await.unwrap();
     assert_ne!(

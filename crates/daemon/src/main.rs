@@ -17,7 +17,7 @@ mod tests;
 const BUS_NAME: &str = "org.vasakos.Preload";
 const OBJECT_PATH: &str = "/org/vasakos/Preload";
 
-use crate::service::{EngineTask, PreloadService};
+use crate::service::{EngineTask, PreloadService, default_config_paths};
 use clap::Parser;
 
 /// Argumentos de línea de comandos.
@@ -89,7 +89,7 @@ async fn run(
     config: Config,
     shutdown: impl Future<Output = std::io::Result<()>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_conn, engine) = serve(builder, config).await?;
+    let (_conn, engine) = serve(builder, PreloadService::new(config).await?).await?;
     info!("Servicio publicado");
 
     let result = shutdown.await;
@@ -103,12 +103,9 @@ async fn run(
 /// sobre esa misma instancia, para que la interfaz D-Bus vea el motor que corre.
 async fn serve(
     builder: connection::Builder<'_>,
-    config: Config,
+    service: PreloadService,
 ) -> Result<(Connection, EngineTask), Box<dyn std::error::Error>> {
-    let conn = builder
-        .serve_at(OBJECT_PATH, PreloadService::new(config).await?)?
-        .build()
-        .await?;
+    let conn = builder.serve_at(OBJECT_PATH, service)?.build().await?;
 
     let engine = conn
         .object_server()
@@ -142,14 +139,7 @@ fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> {
     }
 
     // Rutas por defecto
-    let default_paths = vec![
-        PathBuf::from("/etc/vasak-preload/config.toml"),
-        dirs::config_dir()
-            .map(|d| d.join("vasak-preload/config.toml"))
-            .unwrap_or_default(),
-    ];
-
-    Ok(Config::cargar_multiple(default_paths)?)
+    Ok(Config::cargar_multiple(default_config_paths())?)
 }
 
 /// Espera SIGTERM (systemd) o SIGINT (Ctrl+C).

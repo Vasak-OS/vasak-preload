@@ -38,6 +38,18 @@ pub struct PreloadService {
     control_tx: Mutex<Option<mpsc::UnboundedSender<ControlEvent>>>,
     stores: Arc<RwLock<Stores>>,
     stats: Arc<Mutex<DaemonStats>>,
+    /// Archivos que lee `ReloadConfig`, en orden.
+    reload_paths: Vec<PathBuf>,
+}
+
+/// Archivos de configuración por omisión: el del sistema y el del usuario.
+pub fn default_config_paths() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/etc/vasak-preload/config.toml"),
+        dirs::config_dir()
+            .map(|d| d.join("vasak-preload/config.toml"))
+            .unwrap_or_default(),
+    ]
 }
 
 impl PreloadService {
@@ -48,7 +60,16 @@ impl PreloadService {
             control_tx: Mutex::new(None),
             stores: Arc::new(RwLock::new(Stores::default())),
             stats: Arc::new(Mutex::new(DaemonStats::default())),
+            reload_paths: default_config_paths(),
         })
+    }
+
+    /// Cambia los archivos que lee `ReloadConfig` (las pruebas los apuntan a
+    /// un directorio temporal para no depender de la máquina).
+    #[cfg(test)]
+    pub fn with_reload_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.reload_paths = paths;
+        self
     }
 
     /// Inicia el motor en background.
@@ -196,13 +217,8 @@ impl PreloadService {
     }
 
     async fn reload_config(&self) -> zbus::fdo::Result<()> {
-        let new_config = Config::cargar_multiple(vec![
-            PathBuf::from("/etc/vasak-preload/config.toml"),
-            dirs::config_dir()
-                .map(|d| d.join("vasak-preload/config.toml"))
-                .unwrap_or_default(),
-        ])
-        .map_err(|e| FdoError::Failed(format!("configuración inválida: {e}")))?;
+        let new_config = Config::cargar_multiple(self.reload_paths.clone())
+            .map_err(|e| FdoError::Failed(format!("configuración inválida: {e}")))?;
 
         let bundle = ReloadBundle {
             config: new_config.clone(),
