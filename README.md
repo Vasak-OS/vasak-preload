@@ -1,154 +1,375 @@
-# vasak-preload
+# Vasak preload
 
-System optimizer for VasakOS: prefetches binaries and shared libraries into memory based on usage patterns to achieve faster application startup times.
+Precarga de binarios y bibliotecas según patrones de uso (VasakOS)
 
-## Overview
+---
 
-`vasak-preload` is a daemon that monitors running applications, builds a Markov-based probabilistic model of application transitions, predicts what applications the user might launch next, and prefetches those binaries and their dependencies into memory using `posix_fadvise`.
+## Tecnología
 
-It's inspired by [preload-rs](https://github.com/arunanshub/preload-rs) but designed specifically for VasakOS with:
+[![Rust](https://img.shields.io/badge/Rust-1.82%2B-orange?style=flat&logo=rust)](https://www.rust-lang.org/) [![systemd](https://img.shields.io/badge/systemd-256%2B-24283b?style=flat&logo=systemd)](https://systemd.io/) [![D-Bus](https://img.shields.io/badge/D-Bus-1.15%2B-42b883?style=flat&logo=dbus)](https://dbus.freedesktop.org/) [![zbus](https://img.shields.io/badge/zbus-4.0-orange?style=flat&logo=rust)](https://github.com/dbus2/zbus)
 
-- **Integration with existing VasakOS infrastructure**: Uses `vasak-monitor`'s process sampling, zbus for D-Bus IPC, shared configuration patterns
-- **D-Bus control interface**: Full control via `vasak-preload-cli` or D-Bus directly
-- **Hot config reload**: Change configuration without restarting
-- **Persistent state**: SQLite + rkyv for fast serialization
-- **Safety first**: Runs with minimal privileges, configurable memory limits
+## Estado
 
-## Architecture
+[![CI](https://github.com/Vasak-OS/vasak-preload/actions/workflows/ci.yml/badge.svg)](https://github.com/Vasak-OS/vasak-preload/actions/workflows/ci.yml)
+[![Versión](https://img.shields.io/github/v/release/Vasak-OS/vasak-preload?style=flat&label=Versi%C3%B3n)](https://github.com/Vasak-OS/vasak-preload/releases)
+[![Licencia](https://img.shields.io/github/license/Vasak-OS/vasak-preload?style=flat)](LICENSE)
+[![Cobertura](https://sonarcloud.io/api/project_badges/measure?project=Vasak-OS_vasak-preload&metric=coverage&style=flat)](https://sonarcloud.io/summary/new_code?id=Vasak-OS_vasak-preload)
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=Vasak-OS_vasak-preload&metric=alert_status&style=flat)](https://sonarcloud.io/summary/new_code?id=Vasak-OS_vasak-preload)
+[![Tamaño repo](https://img.shields.io/github/repo-size/Vasak-OS/vasak-preload?style=flat)](https://github.com/Vasak-OS/vasak-preload)
 
+---
+
+## Descripción
+
+Precarga de binarios y bibliotecas según patrones de uso (VasakOS)
+
+**Para el usuario:** Precarga de binarios y bibliotecas según patrones de uso (VasakOS)
+
+**Integración VasakOS:** Integra con el ecosistema VasakOS vía D-Bus y configuración compartida.
+
+---
+
+## Arquitectura (diagramas)
+
+> Copia y pega la plantilla que necesites, descomenta y adapta.
+
+### Flujo de datos
+
+```mermaid
+<!--
+graph TD
+    A[Entrada: Teclado / Ratón / D-Bus / Sistema] --> B[Procesamiento: Core Rust + Tauri Commands]
+    B --> C[Salida: UI actualizada / Acciones del sistema]
+    style A fill:#e1f5fe
+    style C fill:#e8f5e9
+-->
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  ProcfsScanner  │────▶│  DefaultModel    │────▶│ MarkovPredictor │
-│  (observation)  │     │  Updater         │     │  (prediction)   │
-└─────────────────┘     └──────────────────┘     └────────┬────────┘
-                                                          │
-                         ┌──────────────────┐             │
-                         │ GreedyPrefetch   │◀────────────┘
-                         │ Planner          │
-                         └────────┬─────────┘
-                                  │
-                         ┌────────▼─────────┐
-                         │ PosixFadvise     │
-                         │ Prefetcher       │
-                         └──────────────────┘
+
+### Componentes internos
+
+```mermaid
+<!--
+flowchart LR
+    subgraph App[Vasak preload]
+        UI[Frontend Vue 3 + vue-libvasak]
+        Core[Core Rust: lógica principal]
+        IPC[Tauri Commands / Eventos]
+        System[Systemd / D-Bus / PipeWire / Wayland]
+    end
+    UI --> IPC
+    IPC --> Core
+    Core --> DBus[(D-Bus / zbus)]
+    Core --> System
+    style UI fill:#f3e5f5
+    style Core fill:#e3f2fd
+    style DBus fill:#fff3e0
+    style System fill:#fce4ec
+-->
 ```
 
-### Components
+### Integración en el sistema VasakOS
 
-| Crate | Purpose |
-|-------|---------|
-| `vasak-preload-config` | Configuration loading/validation (TOML) |
-| `vasak-preload-orchestrator` | Core logic: scanning, modeling, prediction, prefetch |
-| `vasak-preload-protocol` | D-Bus interface definitions |
-| `vasak-preload-daemon` | System daemon with D-Bus service |
-| `vasak-preload-cli` | Command-line client |
+```mermaid
+<!--
+C4Context
+    title Vasak preload en VasakOS
+    Person(usuario, "Usuario", "Persona que usa el sistema")
+    System_Boundary(c1, "VasakOS") {
+        System(app, "Vasak preload", "Precarga de binarios y bibliotecas según patrones de uso (VasakOS)")
+        System_Ext(settings, "vasak-settings", "Configuración central")
+        System_Ext(keyring, "vasak-keyring", "Secrets y claves")
+        System_Ext(accounts, "vasak-accounts", "Cuentas e identidad")
+        System_Ext(permissions, "vasak-permissions", "Permisos y portales")
+    }
+    System_Ext(systemd, "systemd", "Gestión de servicios")
+    System_Ext(dbus, "D-Bus", "Bus de mensajes del sistema")
+    System_Ext(wayland, "Wayland / Wayfire", "Compositor")
+    System_Ext(pipewire, "PipeWire", "Multimedia")
+    Rel(usuario, app, "Usa")
+    Rel(app, settings, "Lee/escribe config")
+    Rel(app, keyring, "Guarda/lee secrets")
+    Rel(app, accounts, "Identidad de cuenta")
+    Rel(app, permissions, "Solicita permisos")
+    Rel(app, systemd, "Activación / sockets")
+    Rel(app, dbus, "Expone / consume interfaces")
+    Rel(app, wayland, "Superficies / protocolos")
+    Rel(app, pipewire, "Streams de audio/video")
+-->
+```
 
-## Building
+---
+
+## Instalación
+
+### Arch Linux (repo oficial)
 
 ```bash
-# From VasakOS root
-cargo build --package vasak-preload-daemon --release
-cargo build --package vasak-preload-cli --release
+pacman -S vasak-vasak-preload
 ```
 
-## Installation
+### Debian / Ubuntu (.deb)
 
 ```bash
-# Install binaries
-sudo cp target/release/vasak-preload /usr/bin/
-sudo cp target/release/vasak-preload-cli /usr/bin/
-
-# Install config
-sudo mkdir -p /etc/vasak-preload
-sudo cp docs/config.example.toml /etc/vasak-preload/config.toml
-
-# Install systemd service
-sudo cp packaging/vasak-preload.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now vasak-preload
+wget https://github.com/Vasak-OS/vasak-preload/releases/download/v{{VERSION}}/vasak-vasak-preload_{{VERSION}}_amd64.deb
+sudo apt install ./vasak-vasak-preload_{{VERSION}}_amd64.deb
 ```
 
-## Usage
-
-### CLI
+### Desde fuente
 
 ```bash
-# Show daemon status
-vasak-preload-cli status
+git clone https://github.com/Vasak-OS/vasak-preload.git
+cd vasak-preload
 
-# Show detailed statistics
-vasak-preload-cli stats
+# Build completo
+cargo build --release --locked
 
-# Show current configuration
-vasak-preload-cli config
+# Instalar binario
+cargo install --locked --path .
 
-# Show top 10 predicted applications
-vasak-preload-cli top --n 10
-
-# Check specific executable
-vasak-preload-cli exe /usr/bin/firefox
-
-# Control daemon
-vasak-preload-cli pause
-vasak-preload-cli resume
-vasak-preload-cli save
-vasak-preload-cli reload
+# Paquetes nativos
+# Arch: makepkg -sf en PKGBUILDS/vasak-preload/
+# Debian: cargo deb --no-build --target-dir target/release/debian
 ```
 
-### D-Bus
+### Flatpak / AppImage
+
+> *Placeholder: añadir cuando exista paquete Flatpak o AppImage oficial.*
+
+---
+
+## Uso rápido
 
 ```bash
-# Get status
-busctl get-property org.vasakos.Preload /org/vasakos/Preload org.vasakos.Preload1 State
-
-# Get stats
-busctl call org.vasakos.Preload /org/vasakos/Preload org.vasakos.Preload1 Stats
-
-# Pause prefetch
-busctl call org.vasakos.Preload /org/vasakos/Preload org.vasakos.Preload1 Pause
-
-# Get top predictions
-busctl call org.vasakos.Preload /org/vasakos/Preload org.vasakos.Preload1 GetTopPredictions u 10
+# Se lanza automáticamente (systemd --user) o manualmente:
+vasak-preload
 ```
 
-## Configuration
+### Atajos / flags principales
 
-See `docs/config.example.toml` for all options. Key settings:
+| Acción | Comando / Tecla |
+|--------|-----------------|
+| Acción principal | `vasak-preload` |
+| Configuración | `vasak-preload --config` |
+| Ayuda | `vasak-preload --help` |
 
-- **modelo.ciclo**: How often to run a scan/predict/prefetch cycle (default: 20s)
-- **modelo.ventana_activa**: How long an app stays "active" after last seen (default: 1h)
-- **sistema.doprefetch**: Enable/disable actual prefetching (default: true)
-- **sistema.mem_libre_min_pct**: Minimum free memory % before prefetch (default: 10%)
-- **persistencia.estado_path**: SQLite database path (default: `/var/lib/vasak-preload/state.sqlite`)
+> **Captura:** `assets/demo.gif` *(placeholder — sustituir por GIF real)*
 
-## Integration with VasakOS
+---
 
-`vasak-preload` leverages existing VasakOS components:
+## Configuración
 
-- **Process sampling**: Reuses `vasak-monitor/src-tauri/src/muestreo/procesos.rs` logic for robust `/proc` parsing
-- **IPC**: Uses `zbus` like `vasak-connect-daemon`, `vasak-store-daemon`, `vasak-permissions-daemon`
-- **Configuration**: TOML with `toml_edit` like other VasakOS services
-- **Observability**: Structured logging with `tracing`, stats exposed via D-Bus
-- **Testing**: Property-based tests with `proptest`, unit tests alongside code
+### Archivo de configuración
 
-## How it Works
+```
+~/.config/vasak/vasak-preload.toml
+```
 
-1. **Scan**: Every `modelo.ciclo` seconds, read `/proc` for running processes and their memory maps
-2. **Filter**: Apply admission policy (prefixes, max map size, memory pressure)
-3. **Model**: Update Markov graph with observed transitions between applications
-4. **Predict**: Compute probability distribution over applications likely to launch next
-5. **Plan**: Select memory maps to prefetch based on prediction probability and memory budget
-6. **Prefetch**: Use `posix_fadvise(POSIX_FADV_WILLNEED)` to bring pages into page cache
-7. **Persist**: Save model state to SQLite periodically and on shutdown
+### Variables de entorno
 
-## Safety
+| Variable | Descripción | Por defecto |
+|----------|-------------|-------------|
+| `VASAK_DEBUG` | Activa logs de depuración en consola | `false` |
+| `VASAK_PROFILE` | Perfil de rendimiento: `balanced`, `performance`, `power-save` | `balanced` |
 
-- **Memory pressure awareness**: Won't prefetch if free memory < `mem_libre_min_pct`
-- **Size limits**: Ignores mappings larger than `max_mapa` (default 100MiB)
-- **Prefix filtering**: Only monitors configured path prefixes (default: all)
-- **Noop prefetcher**: Default daemon uses `NoopPrefetcher`; enable `PosixFadvisePrefetcher` explicitly
-- **Runs as dedicated user**: Systemd service should run as `vasak-preload` user
+### Integración con `tauri-plugin-config-manager`
 
-## License
+- Esquemas de color: respeta `--ui-primary`, `--ui-surface`, `--ui-focus`, `--ui-on-surface`, `--ui-border`
+- Tema de iconos: usa el tema del sistema (`vasakos-icon-theme`) vía `vicon` lookup
+- Radio de bordes: variable CSS `--ui-radius` del esquema activo (por defecto 12px)
+- Fuentes: `--ui-font-family`, `--ui-font-size-base` desde el esquema
 
-Apache-2.0
+---
+
+## Desarrollo
+
+### Requisitos
+
+- **Rust:** `rustup` toolchain estable (`rust-toolchain.toml` fija la versión)
+- **Node / bun:** `bun` ≥ 1.1 (nunca npm/yarn/pnpm para apps Tauri)
+- **Sistema:** `pkg-config`, `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, `libssl-dev`
+- *`libdbus-1-dev`, `libsystemd-dev` para systemd*
+
+### Dependencias de desarrollo
+
+#### Sistema (paquetes Arch / Debian / Fedora)
+
+`base-devel`, `pkgconf`, `libssl-dev`, `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, `gstreamer1.0-plugins-base`, `gstreamer1.0-plugins-good`, `libpipewire-0.3-dev`, `libwireplumber-0.5-dev`, `libdbus-1-dev`, `libudev-dev`, `libxkbcommon-dev`, `libwayland-dev`, `meson`, `ninja`, `clang`, `lld`
+
+#### Rust
+
+`rustup` → `stable` + `rustfmt` + `clippy`
+
+#### Node
+
+**Solo `bun`** (nunca npm/yarn/pnpm para apps Tauri). `bun --version` ≥ 1.1
+
+#### Herramientas CLI
+
+`just` (command runner), `cargo-binstall` (opcional), `cargo-llvm-cov` (para cobertura)
+
+### Correr la app en desarrollo
+
+```bash
+# Frontend (Vite dev server + Tauri dev)
+bun run tauri dev
+
+# Solo frontend (Vite)
+bun run dev
+
+# Solo backend (cargo watch)
+cargo watch -x "run --bin vasak-preload"
+```
+
+### Compilar / Build de release
+
+```bash
+# Build completo (frontend + backend + bundle)
+bun run tauri build
+
+# Solo frontend (para testear bundle después)
+bun run build
+
+# Solo backend Rust (binario optimizado)
+cargo build --release --locked
+
+# Paquetes nativos
+# Arch: makepkg -sf en PKGBUILDS/vasak-preload/
+# Debian: cargo deb --no-build --target-dir src-tauri/target/release/debian
+```
+
+### Targets principales
+
+```bash
+# Desarrollo (Tauri dev server + hot reload)
+bun run dev
+
+# Build producción
+bun run build
+
+# Solo frontend
+bun run build:frontend
+
+# Solo backend Rust
+cargo build --release --locked
+
+# Lint + tipos (pre-commit / CI)
+bunx --bun biome check .
+bunx vue-tsc --noEmit
+cargo fmt --check
+```
+
+### Pruebas
+
+```bash
+# Suite completa Rust
+cargo test -p vasak-preload -p vasak-preload-lib --locked
+
+# Tests de integración (requieren D-Bus)
+cargo test -p vasak-preload-integration --locked -- --ignored
+```
+
+### Convención de commits
+
+[Conventional Commits](https://www.conventionalcommits.org/es/v1.0.0/):
+
+```
+<tipo>(<ámbito>): <descripción corta>
+
+[cuerpo opcional]
+
+[pie opcional: Closes #N]
+```
+
+Tipos habituales: `feat`, `fix`, `bugfix`, `docs`, `ci`, `chore`, `security`, `refactor`, `perf`, `test`.
+
+### Cómo abrir PR
+
+1. Rama desde `origin/main`:
+   ```bash
+   git worktree add -b feat/tema ~/wt/vasak-preload-tema origin/main
+   ```
+2. Prefijos de rama: `fix/`, `feat/`, `bugfix/`, `docs/`, `ci/`, `chore/`, `security/`
+3. Escribe el fix → **`qa` escribe las pruebas** (fallan sin el fix) → suite verde → abre PR
+4. Al abrir PR, **cuatro cosas obligatorias**:
+   - Asignado a `JoaquinDecima`
+   - Etiqueta `enhancement` o `bug` (+ `ci` / `dependencies` si aplica)
+   - Añadido al proyecto «VasakOS Roadmap»
+   - Status **In Progress**
+
+---
+
+## Arquitectura (texto)
+
+### Crates / módulos principales
+
+| `vasak-preload` | Binario principal / daemon systemd |
+| `vasak-preload-lib` | Lógica compartida / biblioteca pública |
+
+### Interfaces D-Bus / zbus expuestas
+
+| `org.vasak.Vasak-preload` | `GetStatus()`, `StatusChanged(dict)`, `Reload()`, `GetConfig()` | Control y estado del servicio |
+| `org.vasak.Vasak-preload.Admin` | `SetPolicy(dict)`, `AuditLog()` | API administrativa (solo root) |
+
+### Puntos de extensión
+
+- **Plugins:** Sistema de plugins modular
+- **Hooks:** Hooks de ciclo de vida
+- **API pública Rust:** API pública del crate principal
+
+### Features / Cargo features
+
+| Feature | Descripción | Default |
+|---------|-------------|---------|
+| `systemd` | Integración systemd (socket activation) | ✓ |
+| `tracing` | Logging estructurado con tracing | ✓ |
+| `admin` | API administrativa (solo root) | |
+| `pam` | Módulo PAM para autenticación | |
+
+Y para apps Tauri+Vue: features del `tauri.conf.json` → `bundle` / `plugins` / `allowlist` (capabilities).
+
+---
+
+## Pruebas y calidad
+
+- **Cobertura objetivo:** ≥ 80 % del código nuevo (SonarCloud Quality Gate)
+- **Informes:** GitHub Actions → pestaña *SonarCloud Code Analysis* → enlace a SonarCloud
+- **Añadir pruebas:** ver `AGENTS.md` sección 9 (mapa de repos y comandos de prueba)
+- **Regla:** toda corrección lleva prueba escrita por `qa` que falla sin el fix
+
+---
+
+## Contribuir
+
+- **Guía:** [.github/CONTRIBUTING.md](https://github.com/Vasak-OS/.github/blob/main/CONTRIBUTING.md)
+- **Plantillas de issue:** [.github/ISSUE_TEMPLATE/](https://github.com/Vasak-OS/.github/tree/main/ISSUE_TEMPLATE)
+- **Código de conducta:** [CODE_OF_CONDUCT.md](https://github.com/Vasak-OS/.github/blob/main/CODE_OF_CONDUCT.md)
+
+---
+
+## Contribuidores
+
+> **Actualizado automáticamente en CI** — muestra los avatares de quienes han aportado código a este repo.
+
+<div align="center">
+  
+</div>
+
+[Ver todos los contribuidores](https://github.com/Vasak-OS/vasak-preload/graphs/contributors)
+
+---
+
+## Donadores / Sponsors
+
+[![Sponsors](https://img.shields.io/github/sponsors/Vasak-OS?style=flat&label=Sponsors)](https://github.com/sponsors/Vasak-OS)
+
+> **Backers:** *Actualizado automáticamente en CI desde GitHub Sponsors / OpenCollective / Polar.*
+
+[💖 Donar al proyecto](https://github.com/sponsors/Vasak-OS)
+
+---
+
+## Licencia
+
+`MIT` — Copyright © 2026 **Vasak-OS Contributors**
+
+[Ver licencia completa](LICENSE)
