@@ -4,8 +4,11 @@
 
 use crate::domain::{ExeId, ExeKey, MapId, MapKey, MapSegment, MarkovEdge, MarkovState};
 use crate::error::Error;
-use crate::observation::{AdmissionDecision, AdmissionPolicy, CandidateExe, Completeness, Observation, ObservationEvent, ScanWarning};
-use crate::stores::Stores;
+use crate::observation::{
+    AdmissionDecision, AdmissionPolicy, CandidateExe, Completeness, Observation, ObservationEvent,
+    ScanWarning,
+};
+use crate::stores::{EdgeKey, Stores};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -126,28 +129,37 @@ impl ModelUpdater for DefaultModelUpdater {
             }
         }
 
-        // Actualizar modelo de Markov
-        let active_exes: Vec<ExeId> = stores.active.exes().into_iter().collect();
-        for &a in &active_exes {
-            for &b in &active_exes {
-                if a == b {
-                    continue;
-                }
-                let a_running = running_exes.get(&a).copied().unwrap_or(false);
-                let b_running = running_exes.get(&b).copied().unwrap_or(false);
+        // Actualizar modelo de Markov. El conjunto activo todavía es el del
+        // tick anterior: de ahí sale el estado de partida de cada arista.
+        let was_running = stores.active.exes();
+        let dt = current_time.saturating_sub(stores.active.last_update()) as f32;
+        let state_of = |running: &dyn Fn(ExeId) -> bool, key: EdgeKey| {
+            MarkovState::Neither.transition(running(key.a()), running(key.b()))
+        };
+        let before = |id: ExeId| was_running.contains(&id);
+        let now = |id: ExeId| running_exes.contains_key(&id);
 
-                let state = MarkovState::Neither.transition(a_running, b_running);
-                let was_new = stores.ensure_markov_edge(a, b, current_time, state);
-
-                if let Some(edge_key) = crate::stores::EdgeKey::new_opt(a, b) {
-                    if let Some(edge) = stores.markov.get_mut(edge_key) {
-                        if was_new {
-                            delta.edges_added += 1;
-                        } else {
-                            delta.edges_updated += 1;
-                        }
-                    }
+        // Pares nuevos entre lo que corría y lo que corre: sin ellos nunca se
+        // aprende que B arranca mientras A corre.
+        let mut involved: Vec<ExeId> = was_running.iter().copied().collect();
+        involved.extend(running_exes.keys().filter(|id| !was_running.contains(id)));
+        for (i, &x) in involved.iter().enumerate() {
+            for &y in &involved[i + 1..] {
+                let key = EdgeKey::new(x, y);
+                if stores.ensure_markov_edge(x, y, current_time, state_of(&before, key)) {
+                    delta.edges_added += 1;
                 }
+            }
+        }
+
+        // Cada arista observa una vez por tick la transición de su estado
+        // anterior al actual, con la orientación de su clave (a <= b).
+        let keys: Vec<EdgeKey> = stores.markov.iter().map(|(key, _)| key).collect();
+        for key in keys {
+            let (from, to) = (state_of(&before, key), state_of(&now, key));
+            if let Some(edge) = stores.markov.get_mut(key) {
+                edge.observe_transition(from, to, dt);
+                delta.edges_updated += 1;
             }
         }
 
@@ -173,7 +185,10 @@ mod tests {
         let policy = DefaultAdmissionPolicy::new(vec![], vec![], 100_000_000);
 
         let obs = vec![
-            ObservationEvent::ObsBegin { time: 100, scan_id: 1 },
+            ObservationEvent::ObsBegin {
+                time: 100,
+                scan_id: 1,
+            },
             ObservationEvent::MemStat {
                 mem: MemStat {
                     total: 1000,
@@ -195,6 +210,224 @@ mod tests {
 
         let delta = updater.apply(&mut stores, &obs, &policy).unwrap();
         assert_eq!(delta.exes_added, 1);
-        assert!(stores.exes.iter().any(|(_, e)| e.key.path() == Path::new("/usr/bin/firefox")));
+        assert!(
+            stores
+                .exes
+                .iter()
+                .any(|(_, e)| e.key.path() == Path::new("/usr/bin/firefox"))
+        );
+    }
+
+    use crate::observation::{AdmissionPolicy, RejectReason};
+    use crate::stores::EdgeKey;
+
+    fn scan_of(time: u64, running: &[(&str, u32)]) -> Observation {
+        let mut events = vec![ObservationEvent::ObsBegin { time, scan_id: 1 }];
+        for (path, pid) in running {
+            events.push(ObservationEvent::CandidateExe {
+                exe: CandidateExe::new((*path).into(), *pid),
+            });
+            events.push(ObservationEvent::Map {
+                segment: MapSegment::new(format!("{path}.lib").into(), 0, 4096, time),
+                pid: *pid,
+            });
+        }
+        // Un mapa de un proceso que no es candidato: se ignora.
+        events.push(ObservationEvent::Map {
+            segment: MapSegment::new("/huérfano".into(), 0, 1, time),
+            pid: 9999,
+        });
+        events.push(ObservationEvent::ObsEnd {
+            time,
+            scan_id: 1,
+            warnings: vec![],
+        });
+        events
+    }
+
+    fn open_policy() -> DefaultAdmissionPolicy {
+        DefaultAdmissionPolicy::new(vec![], vec![], 100_000_000)
+    }
+
+    /// `early` corre solo en t=0 y `late` arranca en t=20. Con
+    /// `late_has_lower_id`, `late` se crea antes en el almacén y tiene el id
+    /// menor, así que la arista queda orientada al revés.
+    fn early_then_late(late_has_lower_id: bool) -> (Stores, ExeId, ExeId) {
+        let mut stores = Stores::default();
+        let late_key = ExeKey::new("/usr/bin/late".into());
+        let pre_created = late_has_lower_id.then(|| stores.ensure_exe(late_key.clone()));
+        let mut updater = DefaultModelUpdater::new();
+
+        let first = updater
+            .apply(
+                &mut stores,
+                &scan_of(0, &[("/usr/bin/early", 1)]),
+                &open_policy(),
+            )
+            .unwrap();
+        assert_eq!(first.edges_added, 0);
+        assert_eq!(stores.markov.len(), 0);
+
+        let both = [("/usr/bin/early", 1), ("/usr/bin/late", 2)];
+        let second = updater
+            .apply(&mut stores, &scan_of(20, &both), &open_policy())
+            .unwrap();
+        // La arista existe desde el tick en que `late` arranca, y se observó una vez.
+        assert_eq!(second.edges_added, 1);
+        assert_eq!(second.edges_updated, 1);
+
+        let early = stores
+            .exes
+            .id_by_key(&ExeKey::new("/usr/bin/early".into()))
+            .unwrap();
+        let late = pre_created.unwrap_or_else(|| stores.exes.id_by_key(&late_key).unwrap());
+        assert_eq!(late_has_lower_id, late < early);
+        (stores, early, late)
+    }
+
+    /// El estado «sólo `x` corre» según la orientación de la clave.
+    fn only(key: EdgeKey, x: ExeId) -> MarkovState {
+        if key.a() == x {
+            MarkovState::OnlyA
+        } else {
+            MarkovState::OnlyB
+        }
+    }
+
+    fn check_learns_that_late_starts_while_early_runs(late_has_lower_id: bool) {
+        let (stores, early, late) = early_then_late(late_has_lower_id);
+        let key = EdgeKey::new(early, late);
+        let edge = stores.markov.get(key).expect("la arista existe");
+
+        let only_early = only(key, early);
+        let only_late = only(key, late);
+        // Una sola observación: 0 * 0.9 + 0.1. Dos darían 0.19.
+        assert!((edge.transition_probability(only_early, MarkovState::Both) - 0.1).abs() < 1e-6);
+        assert_eq!(
+            edge.transition_probability(only_late, MarkovState::Both),
+            0.0
+        );
+        // El tiempo para dejar el estado usa los 20 s entre los dos escaneos.
+        assert!((edge.time_to_leave[only_early as usize] - 2.0).abs() < 1e-6);
+        assert_eq!(edge.both_running_time, 0);
+    }
+
+    #[test]
+    fn la_arista_aprende_que_b_arranca_mientras_a_corre() {
+        check_learns_that_late_starts_while_early_runs(false);
+    }
+
+    #[test]
+    fn la_arista_aprende_lo_mismo_con_los_ids_en_el_orden_contrario() {
+        check_learns_that_late_starts_while_early_runs(true);
+    }
+
+    #[test]
+    fn el_tiempo_juntos_crece_mientras_los_dos_corren() {
+        let (mut stores, early, late) = early_then_late(false);
+        let mut updater = DefaultModelUpdater::new();
+        let both = [("/usr/bin/early", 1), ("/usr/bin/late", 2)];
+
+        for (time, expected) in [(40, 20), (60, 40)] {
+            let delta = updater
+                .apply(&mut stores, &scan_of(time, &both), &open_policy())
+                .unwrap();
+            assert_eq!((delta.edges_added, delta.edges_updated), (0, 1));
+            let edge = stores.markov.get(EdgeKey::new(early, late)).unwrap();
+            assert_eq!(edge.both_running_time, expected);
+        }
+        let edge = stores.markov.get(EdgeKey::new(early, late)).unwrap();
+        assert!(edge.transition_probability(MarkovState::Both, MarkovState::Both) > 0.0);
+    }
+
+    #[test]
+    fn cada_arista_se_observa_una_sola_vez_por_tick() {
+        let mut stores = Stores::default();
+        let mut updater = DefaultModelUpdater::new();
+        let steps: [(u64, &[(&str, u32)], u32, u32); 3] = [
+            (0, &[("/a", 1), ("/b", 2)], 1, 1),
+            // `c` arranca: dos aristas nuevas y la de (a, b) ya existente.
+            (20, &[("/a", 1), ("/b", 2), ("/c", 3)], 2, 3),
+            // Sólo `c` sigue; las tres aristas observan igual.
+            (40, &[("/c", 3)], 0, 3),
+        ];
+        for (time, running, added, updated) in steps {
+            let delta = updater
+                .apply(&mut stores, &scan_of(time, running), &open_policy())
+                .unwrap();
+            assert_eq!((delta.edges_added, delta.edges_updated), (added, updated));
+            assert_eq!(delta.edges_updated as usize, stores.markov.len());
+        }
+        assert_eq!(stores.markov.len(), 3);
+    }
+
+    #[test]
+    fn el_ejecutable_que_deja_de_aparecer_queda_detenido() {
+        let mut stores = Stores::default();
+        let mut updater = DefaultModelUpdater::new();
+        updater
+            .apply(&mut stores, &scan_of(0, &[("/a", 1)]), &open_policy())
+            .unwrap();
+        updater
+            .apply(&mut stores, &scan_of(20, &[]), &open_policy())
+            .unwrap();
+
+        let a = stores.exes.id_by_key(&ExeKey::new("/a".into())).unwrap();
+        let exe = stores.exes.get(a).unwrap();
+        assert!(!exe.running);
+        assert_eq!(exe.last_seen_time, Some(20));
+        assert!(stores.active.is_empty());
+    }
+
+    struct FixedDecision(AdmissionDecision);
+
+    impl AdmissionPolicy for FixedDecision {
+        fn allow_exe(&self, _path: &Path) -> bool {
+            true
+        }
+
+        fn allow_map(&self, _path: &Path) -> bool {
+            true
+        }
+
+        fn decide(&self, _candidate: &CandidateExe) -> AdmissionDecision {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn un_candidato_rechazado_no_entra_al_modelo() {
+        let mut stores = Stores::default();
+        let policy = FixedDecision(AdmissionDecision::Reject {
+            reason: RejectReason::ExeNotAllowed,
+        });
+
+        let delta = DefaultModelUpdater::new()
+            .apply(&mut stores, &scan_of(0, &[("/a", 1)]), &policy)
+            .unwrap();
+
+        assert_eq!(delta.exes_added, 0);
+        assert!(stores.exes.is_empty());
+        assert!(stores.active.is_empty());
+    }
+
+    #[test]
+    fn segun_la_completitud_se_guardan_o_no_los_mapas() {
+        for (completeness, maps) in [
+            (Completeness::ExeOnly, 0),
+            (Completeness::Partial, 1),
+            (Completeness::Full, 1),
+        ] {
+            let mut stores = Stores::default();
+            let policy = FixedDecision(AdmissionDecision::Accept { completeness });
+
+            let delta = DefaultModelUpdater::new()
+                .apply(&mut stores, &scan_of(0, &[("/a", 1)]), &policy)
+                .unwrap();
+
+            assert_eq!(delta.exes_added, 1);
+            assert_eq!(delta.maps_added, maps);
+            assert_eq!(stores.maps.len(), maps as usize);
+        }
     }
 }
