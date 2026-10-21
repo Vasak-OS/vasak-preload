@@ -176,3 +176,36 @@ fn un_campo_de_otro_tipo_no_se_convierte() {
         assert!(DaemonStats::try_from(owned).is_err(), "campo {malo}");
     }
 }
+
+/// Estructura de `n` campos `t` (u64). `n` >= 1 (D-Bus no tiene structs vacíos).
+fn struct_de(n: usize) -> Value<'static> {
+    let mut b = zvariant::StructureBuilder::new();
+    for _ in 0..n {
+        b = b.add_field(0u64);
+    }
+    Value::from(b.build().unwrap())
+}
+
+#[test]
+fn una_estructura_de_otra_forma_devuelve_error_y_no_entra_en_panico() {
+    // Un cli de otra versión manda otra cantidad de campos que la esperada.
+    // Antes del arreglo, el derive hacía `fields.remove(0)` sin mirar el largo
+    // y entraba en pánico con una estructura más corta; ahora se comprueba la
+    // cantidad y se devuelve un error, tanto de más como de menos.
+    for n in [1usize, 5, 7] {
+        let s = struct_de(n);
+        let owned = OwnedValue::try_from(s.try_clone().unwrap()).unwrap();
+        assert!(ConfigSnapshot::try_from(s).is_err(), "{n} campos");
+        assert!(
+            ConfigSnapshot::try_from(owned).is_err(),
+            "{n} campos (owned)"
+        );
+    }
+
+    for n in [1usize, 18, 20] {
+        let s = struct_de(n);
+        let owned = OwnedValue::try_from(s.try_clone().unwrap()).unwrap();
+        assert!(DaemonStats::try_from(s).is_err(), "{n} campos");
+        assert!(DaemonStats::try_from(owned).is_err(), "{n} campos (owned)");
+    }
+}
