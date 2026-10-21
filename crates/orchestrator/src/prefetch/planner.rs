@@ -72,7 +72,11 @@ impl super::PrefetchPlanner for GreedyPrefetchPlanner {
         }
 
         // Ordenar por prioridad descendente
-        candidates.sort_by(|a, b| b.priority.partial_cmp(&a.priority).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            b.priority
+                .partial_cmp(&a.priority)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Seleccionar hasta agotar presupuesto
         let mut selected = Vec::new();

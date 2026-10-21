@@ -8,10 +8,7 @@ use crate::domain::{MapSegment, MemStat};
 #[derive(Debug, Clone)]
 pub enum ObservationEvent {
     /// Inicio de un ciclo de observación.
-    ObsBegin {
-        time: u64,
-        scan_id: u64,
-    },
+    ObsBegin { time: u64, scan_id: u64 },
     /// Fin de un ciclo de observación.
     ObsEnd {
         time: u64,

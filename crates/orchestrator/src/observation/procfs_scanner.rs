@@ -7,7 +7,7 @@
 use crate::domain::{MapSegment, MemStat};
 use crate::error::Error;
 use crate::observation::{CandidateExe, Observation, ObservationEvent, ScanWarning, Scanner};
-use procfs::process::{Process, MemoryMaps};
+use procfs::process::{MemoryMaps, Process};
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -91,7 +91,8 @@ impl ProcfsScanner {
 
     /// Convierte MemoryMaps de procfs a MapSegment.
     fn maps_to_segments(maps: MemoryMaps, page_size: u64) -> Vec<MapSegment> {
-        maps.0.into_iter()
+        maps.0
+            .into_iter()
             .filter_map(|m| {
                 let path = match m.pathname {
                     procfs::process::MMapPath::Path(p) => p,
@@ -159,7 +160,10 @@ impl Scanner for ProcfsScanner {
                         candidate.total_size += seg.length;
                         candidate.maps.push(seg.clone());
                         // Emitir evento Map para el model_updater
-                        events.push(ObservationEvent::Map { segment: seg, pid: pid_u32 });
+                        events.push(ObservationEvent::Map {
+                            segment: seg,
+                            pid: pid_u32,
+                        });
                     }
                 }
                 Err(_) => {
@@ -193,6 +197,9 @@ mod tests {
         assert!(!events.is_empty());
         // Debe tener al menos ObsBegin y ObsEnd
         assert!(matches!(events[0], ObservationEvent::ObsBegin { .. }));
-        assert!(matches!(events.last(), Some(ObservationEvent::ObsEnd { .. })));
+        assert!(matches!(
+            events.last(),
+            Some(ObservationEvent::ObsEnd { .. })
+        ));
     }
 }

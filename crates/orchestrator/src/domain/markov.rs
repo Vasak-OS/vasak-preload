@@ -57,8 +57,7 @@ impl MarkovEdge {
         let to_idx = to as usize;
 
         // Actualizar tiempo para dejar el estado
-        self.time_to_leave[from_idx] =
-            (self.time_to_leave[from_idx] * 0.9) + (dt * 0.1);
+        self.time_to_leave[from_idx] = (self.time_to_leave[from_idx] * 0.9) + (dt * 0.1);
 
         // Actualizar probabilidad de transición
         for i in 0..4 {

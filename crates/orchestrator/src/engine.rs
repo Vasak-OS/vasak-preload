@@ -207,6 +207,9 @@ impl PreloadEngine {
             let mut did_tick = false;
 
             tokio::select! {
+                // `biased`: con la cancelación y un tick listos a la vez, el
+                // apagado gana en lugar de perder ciclos eligiendo otro tick.
+                biased;
                 _ = cancel.cancelled() => {
                     if self.config.persistencia.save_on_shutdown {
                         let _ = self.save().await;
@@ -237,7 +240,16 @@ impl PreloadEngine {
                 let elapsed = tick_start.elapsed();
                 if elapsed < self.config.modelo.ciclo {
                     let sleep_for = self.config.modelo.ciclo - elapsed;
-                    self.services.clock.sleep(sleep_for).await;
+                    // El sueño entre ciclos tiene que ceder ante la cancelación:
+                    // si no, un SIGTERM espera todo el ciclo y puede pasarse del
+                    // TimeoutStopSec, que mata el proceso sin el guardado final.
+                    // Al cancelarse deja de dormir y el `select!` de arriba
+                    // (biased, con la cancelación primero) hace el apagado.
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {}
+                        _ = self.services.clock.sleep(sleep_for) => {}
+                    }
                 }
             }
         }
@@ -950,6 +962,36 @@ mod tests {
         }
     }
 
+    /// Reloj cuyo sueño entre ciclos no termina nunca: deja al motor dormido
+    /// hasta que algo más lo despierte (la cancelación, si cede).
+    struct PendingSleepClock;
+
+    #[async_trait]
+    impl crate::clock::Clock for PendingSleepClock {
+        fn now(&self) -> u64 {
+            0
+        }
+
+        async fn sleep(&self, _dur: Duration) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Repositorio que cuenta cuántas veces se guardó.
+    struct SaveCountingRepository(Arc<AtomicU32>);
+
+    #[async_trait]
+    impl StateRepository for SaveCountingRepository {
+        async fn load(&self) -> Result<StoresSnapshot, Error> {
+            NoopRepository.load().await
+        }
+
+        async fn save(&self, _snapshot: &StoresSnapshot) -> Result<(), Error> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     fn services_with_scanner(
         scanner: Box<dyn Scanner + Send + Sync>,
         prefetcher: Box<dyn Prefetcher + Send + Sync>,
@@ -1119,6 +1161,51 @@ mod tests {
         cancel.cancel();
         task.await.unwrap().unwrap();
         assert!(view.read().await.last_tick.is_some());
+    }
+
+    #[tokio::test]
+    async fn al_apagar_el_sueno_entre_ciclos_cede_y_hace_el_guardado_final() {
+        let saves = Arc::new(AtomicU32::new(0));
+        let mut services = scanning_services(Box::new(NoopPrefetcher));
+        services.clock = Box::new(PendingSleepClock);
+        services.repo = Box::new(SaveCountingRepository(saves.clone()));
+
+        let mut config = Config::default();
+        // Ciclo largo: el sueño entre ciclos no termina solo.
+        config.modelo.ciclo = Duration::from_secs(3600);
+        config.persistencia.autosave_interval = Some(Duration::ZERO); // sin autosave
+        config.persistencia.save_on_shutdown = true;
+
+        let mut engine = PreloadEngine::new(config, services).await.unwrap();
+        let view = Arc::new(RwLock::new(EngineView::default()));
+        engine.publish_to(view.clone());
+
+        let cancel = CancellationToken::new();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { engine.run_until(cancel, rx).await }
+        });
+
+        // Un tick se completó y se publicó: el motor está ahora en el sueño
+        // entre ciclos (que no termina solo).
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while view.read().await.last_tick.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("el motor no completó un tick");
+
+        cancel.cancel();
+        // Sin el arreglo el sueño no cede y `run_until` no vuelve: este timeout
+        // falla. Con el arreglo vuelve enseguida y guarda una vez al apagar.
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("run_until no terminó tras la cancelación")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saves.load(Ordering::SeqCst), 1, "faltó el guardado final");
     }
 
     #[tokio::test]

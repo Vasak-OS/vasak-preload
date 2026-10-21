@@ -22,12 +22,10 @@ use vasak_preload_protocol::{DaemonState, PreloadProxy};
 use zbus::proxy::CacheProperties;
 use zbus::{Connection, Guid, connection};
 
-/// Margen para que el motor se apague. Holgado a propósito: el sueño entre
-/// ciclos no se interrumpe y el `select!` de `run_until` no prioriza la
-/// cancelación, así que con un ciclo de 1 s el apagado tarda una cantidad
-/// geométrica de ciclos (2/3 de las veces elige otro tick). Con 60 ciclos de
-/// margen la probabilidad de pasarse es despreciable.
-const APAGADO_MAXIMO: Duration = Duration::from_secs(60);
+/// Margen para que el motor se apague. Ajustado: el `select!` de `run_until` es
+/// `biased` con la cancelación primero y el sueño entre ciclos cede ante ella,
+/// así que el apagado no espera al ciclo. 3 s cubre la lentitud del CI.
+const APAGADO_MAXIMO: Duration = Duration::from_secs(3);
 
 /// `model_time` que ningún motor de estas pruebas alcanza: se escribe en el
 /// estado en disco para saber si después lo pisó un guardado del motor.
