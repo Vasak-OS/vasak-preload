@@ -4,15 +4,14 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use vasak_preload_config::Config;
 use vasak_preload_orchestrator::{
-    ControlEvent, DefaultAdmissionPolicy, DefaultModelUpdater, ExeKey, GreedyPrefetchPlanner,
-    MarkovPredictor, NoopPrefetcher, Predictor, PreloadEngine, ProcfsScanner, ReloadBundle,
-    Services, SqliteRepository, Stores, SystemClock,
+    ControlEvent, DefaultAdmissionPolicy, DefaultModelUpdater, EngineView, ExeKey,
+    GreedyPrefetchPlanner, MarkovPredictor, NoopPrefetcher, Predictor, PreloadEngine, ReloadBundle,
+    Scanner, Services, SqliteRepository, SystemClock,
 };
 use vasak_preload_protocol::{ConfigSnapshot, DaemonState, DaemonStats, ExeState, ExeStateWrapper};
 use zbus::fdo::Error as FdoError;
@@ -36,8 +35,9 @@ impl EngineTask {
 pub struct PreloadService {
     config: RwLock<Config>,
     control_tx: Mutex<Option<mpsc::UnboundedSender<ControlEvent>>>,
-    stores: Arc<RwLock<Stores>>,
-    stats: Arc<Mutex<DaemonStats>>,
+    state: Mutex<DaemonState>,
+    /// Lo que publica el motor: almacenes, último tick y pausa.
+    view: Arc<RwLock<EngineView>>,
     /// De dónde sale la configuración: `ReloadConfig` la vuelve a leer del
     /// mismo lugar que el arranque.
     config_source: ConfigSource,
@@ -90,14 +90,18 @@ impl PreloadService {
         Ok(Self {
             config: RwLock::new(config),
             control_tx: Mutex::new(None),
-            stores: Arc::new(RwLock::new(Stores::default())),
-            stats: Arc::new(Mutex::new(DaemonStats::default())),
+            state: Mutex::new(DaemonState::Starting),
+            view: Arc::new(RwLock::new(EngineView::default())),
             config_source,
         })
     }
 
-    /// Inicia el motor en background.
-    pub async fn start_engine(&self) -> Result<EngineTask, Box<dyn std::error::Error>> {
+    /// Inicia el motor en background con el escáner dado (en producción,
+    /// `ProcfsScanner`; las pruebas inyectan uno que no depende de `/proc`).
+    pub async fn start_engine(
+        &self,
+        scanner: Box<dyn Scanner + Send + Sync>,
+    ) -> Result<EngineTask, Box<dyn std::error::Error>> {
         let config = self.config.read().await.clone();
 
         // Crear repositorio de persistencia
@@ -105,7 +109,7 @@ impl PreloadService {
 
         // Crear servicios
         let services = Services {
-            scanner: Box::new(ProcfsScanner::new()),
+            scanner,
             admission: Box::new(DefaultAdmissionPolicy::new(
                 config.sistema.exeprefix.clone(),
                 config.sistema.mapprefix.clone(),
@@ -126,6 +130,8 @@ impl PreloadService {
             PreloadEngine::new(config.clone(), services).await?
         };
 
+        engine.publish_to(self.view.clone());
+
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
 
@@ -136,35 +142,16 @@ impl PreloadService {
             }
         });
 
-        // Task para actualizar stats periódicamente
-        let stores = self.stores.clone();
-        let stats = self.stats.clone();
-        let cancel_stats = cancel.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
-            while !cancel_stats.is_cancelled() {
-                interval.tick().await;
-                if cancel_stats.is_cancelled() {
-                    break;
-                }
-                update_stats(&stores, &stats).await;
-            }
-        });
-
         *self.control_tx.lock().await = Some(control_tx);
-
-        // Actualizar estado inicial
-        self.stats.lock().await.state = DaemonState::Running;
-        update_stats(&self.stores, &self.stats).await;
+        *self.state.lock().await = DaemonState::Running;
 
         Ok(EngineTask { cancel, task })
     }
 
-    /// Los almacenes que lee la interfaz, para poblarlos desde las pruebas
-    /// mientras el motor no los comparta (issue #11).
+    /// La vista que lee la interfaz, para poblarla desde las pruebas.
     #[cfg(test)]
-    pub(crate) fn stores(&self) -> Arc<RwLock<Stores>> {
-        self.stores.clone()
+    pub(crate) fn view(&self) -> Arc<RwLock<EngineView>> {
+        self.view.clone()
     }
 
     /// Manda un evento al motor. Falla si el motor todavía no arrancó (el
@@ -177,17 +164,36 @@ impl PreloadService {
     }
 }
 
-/// Actualiza las estadísticas desde los almacenes.
-async fn update_stats(stores: &Arc<RwLock<Stores>>, stats: &Arc<Mutex<DaemonStats>>) {
-    let stores = stores.read().await;
-    let mut stats = stats.lock().await;
-
-    stats.scan_count = stores.model_time;
-    stats.exe_count = stores.exes.len() as u32;
-    stats.map_count = stores.maps.len() as u32;
-    stats.edge_count = stores.markov.len() as u32;
-    stats.active_count = stores.active.exes().len() as u32;
-    stats.model_time = stores.model_time;
+/// Arma las estadísticas a partir de lo que publicó el motor.
+pub(crate) fn stats_from_view(state: DaemonState, view: &EngineView) -> DaemonStats {
+    let stores = &view.stores;
+    let mut stats = DaemonStats {
+        state,
+        exe_count: stores.exes.len() as u32,
+        map_count: stores.maps.len() as u32,
+        edge_count: stores.markov.len() as u32,
+        active_count: stores.active.len() as u32,
+        model_time: stores.model_time,
+        ..DaemonStats::default()
+    };
+    if let Some(tick) = &view.last_tick {
+        stats.scan_count = tick.scan_id;
+        stats.last_tick_scan_id = tick.scan_id;
+        stats.last_tick_exes_added = tick.model_delta.exes_added;
+        stats.last_tick_maps_added = tick.model_delta.maps_added;
+        stats.last_tick_edges_added = tick.model_delta.edges_added;
+        stats.last_tick_edges_updated = tick.model_delta.edges_updated;
+        stats.last_tick_prediction_exes = tick.prediction.total_exes as u32;
+        stats.last_tick_prediction_max_prob = f64::from(tick.prediction.max_probability);
+        stats.last_tick_prefetch_attempted = tick.prefetch.attempted;
+        stats.last_tick_prefetch_succeeded = tick.prefetch.succeeded;
+        stats.last_tick_prefetch_failed = tick.prefetch.failed;
+        stats.last_tick_prefetch_bytes = tick.prefetch.bytes_prefetched;
+        if let Some(mem) = &tick.memstat {
+            stats.last_tick_mem_free_pct = mem.free_percent();
+        }
+    }
+    stats
 }
 
 /// Implementación de la interfaz D-Bus.
@@ -195,12 +201,13 @@ async fn update_stats(stores: &Arc<RwLock<Stores>>, stats: &Arc<Mutex<DaemonStat
 impl PreloadService {
     #[zbus(property)]
     async fn state(&self) -> zbus::fdo::Result<DaemonState> {
-        Ok(self.stats.lock().await.state)
+        Ok(*self.state.lock().await)
     }
 
     #[zbus(property)]
     async fn stats(&self) -> zbus::fdo::Result<DaemonStats> {
-        Ok(self.stats.lock().await.clone())
+        let state = *self.state.lock().await;
+        Ok(stats_from_view(state, &*self.view.read().await))
     }
 
     #[zbus(property)]
@@ -223,15 +230,19 @@ impl PreloadService {
     }
 
     async fn pause(&self) -> zbus::fdo::Result<()> {
-        let mut stats = self.stats.lock().await;
-        stats.state = DaemonState::Paused;
+        // El candado cubre el envío y la escritura: con Pause y Resume a la vez,
+        // el estado queda en el mismo orden que los eventos que recibe el motor.
+        let mut state = self.state.lock().await;
+        self.send(ControlEvent::SetPaused(true)).await?;
+        *state = DaemonState::Paused;
         info!("Prefetch pausado");
         Ok(())
     }
 
     async fn resume(&self) -> zbus::fdo::Result<()> {
-        let mut stats = self.stats.lock().await;
-        stats.state = DaemonState::Running;
+        let mut state = self.state.lock().await;
+        self.send(ControlEvent::SetPaused(false)).await?;
+        *state = DaemonState::Running;
         info!("Prefetch reanudado");
         Ok(())
     }
@@ -266,8 +277,9 @@ impl PreloadService {
     }
 
     async fn get_top_predictions(&self, n: u32) -> zbus::fdo::Result<Vec<(String, f32)>> {
-        let stores = self.stores.read().await;
-        let prediction = MarkovPredictor::new().predict(&stores);
+        let view = self.view.read().await;
+        let stores = &view.stores;
+        let prediction = MarkovPredictor::new().predict(stores);
 
         let mut result = Vec::new();
         for (exe_id, prob) in prediction.top_n(n as usize) {
@@ -279,7 +291,8 @@ impl PreloadService {
     }
 
     async fn get_exe_state(&self, path: String) -> zbus::fdo::Result<ExeStateWrapper> {
-        let stores = self.stores.read().await;
+        let view = self.view.read().await;
+        let stores = &view.stores;
 
         let exe_key = ExeKey::new(PathBuf::from(&path));
         let Some(exe) = stores
@@ -291,7 +304,7 @@ impl PreloadService {
         };
         let (exe_id, exe) = exe;
 
-        let prediction = MarkovPredictor::new().predict(&stores);
+        let prediction = MarkovPredictor::new().predict(stores);
 
         Ok(ExeStateWrapper::some(ExeState {
             path,

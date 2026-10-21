@@ -19,6 +19,7 @@ const OBJECT_PATH: &str = "/org/vasakos/Preload";
 
 use crate::service::{ConfigSource, EngineTask, PreloadService};
 use clap::Parser;
+use vasak_preload_orchestrator::{ProcfsScanner, Scanner};
 
 /// Argumentos de línea de comandos.
 #[derive(Parser, Debug)]
@@ -94,7 +95,12 @@ async fn run(
     source: ConfigSource,
     shutdown: impl Future<Output = std::io::Result<()>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_conn, engine) = serve(builder, PreloadService::new(config, source).await?).await?;
+    let (_conn, engine) = serve(
+        builder,
+        PreloadService::new(config, source).await?,
+        Box::new(ProcfsScanner::new()),
+    )
+    .await?;
     info!("Servicio publicado");
 
     let result = shutdown.await;
@@ -109,6 +115,7 @@ async fn run(
 async fn serve(
     builder: connection::Builder<'_>,
     service: PreloadService,
+    scanner: Box<dyn Scanner + Send + Sync>,
 ) -> Result<(Connection, EngineTask), Box<dyn std::error::Error>> {
     let conn = builder.serve_at(OBJECT_PATH, service)?.build().await?;
 
@@ -118,7 +125,7 @@ async fn serve(
         .await?
         .get()
         .await
-        .start_engine()
+        .start_engine(scanner)
         .await?;
 
     Ok((conn, engine))

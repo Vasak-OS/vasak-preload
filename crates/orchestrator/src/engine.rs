@@ -15,8 +15,9 @@ use crate::prediction::{Prediction, Predictor};
 use crate::prefetch::{PrefetchPlanner, PrefetchReport, Prefetcher};
 use crate::stores::Stores;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime};
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -47,6 +48,8 @@ pub enum ControlEvent {
     Reload(Box<ReloadBundle>),
     DumpStatus,
     SaveNow,
+    /// Pausa (true) o reanuda (false) el prefetch; el escaneo y el modelo siguen.
+    SetPaused(bool),
 }
 
 /// Reporte de un ciclo (tick) del motor.
@@ -59,6 +62,14 @@ pub struct TickReport {
     pub memstat: Option<MemStat>,
 }
 
+/// Lo que el motor publica para quien lo mira desde afuera (el servicio D-Bus).
+#[derive(Debug, Default, Clone)]
+pub struct EngineView {
+    pub stores: Stores,
+    pub last_tick: Option<TickReport>,
+    pub paused: bool,
+}
+
 /// Motor principal que ejecuta ciclos de escaneo/predicción/prefetch.
 pub struct PreloadEngine {
     config: Config,
@@ -66,6 +77,8 @@ pub struct PreloadEngine {
     stores: Stores,
     scan_id: u64,
     last_save: Instant,
+    paused: bool,
+    view: Option<Arc<RwLock<EngineView>>>,
 }
 
 impl PreloadEngine {
@@ -77,6 +90,8 @@ impl PreloadEngine {
             stores: Stores::default(),
             scan_id: 0,
             last_save: Instant::now(),
+            paused: false,
+            view: None,
         })
     }
 
@@ -90,6 +105,8 @@ impl PreloadEngine {
             stores,
             scan_id: 0,
             last_save: Instant::now(),
+            paused: false,
+            view: None,
         })
     }
 
@@ -135,7 +152,7 @@ impl PreloadEngine {
             Prediction::default()
         };
 
-        let plan = if self.config.sistema.doprefetch {
+        let plan = if self.config.sistema.doprefetch && !self.paused {
             if let Some(mem) = memstat {
                 self.services.planner.plan(&prediction, &self.stores, &mem)
             } else {
@@ -183,6 +200,8 @@ impl PreloadEngine {
             .autosave_interval
             .unwrap_or(self.config.sistema.autosave);
 
+        self.publish(None).await;
+
         loop {
             let tick_start = Instant::now();
             let mut did_tick = false;
@@ -197,9 +216,11 @@ impl PreloadEngine {
                 }
                 Some(event) = control_rx.recv() => {
                     self.handle_control(event).await?;
+                    self.publish(None).await;
                 }
                 result = self.tick() => {
-                    result?;
+                    let report = result?;
+                    self.publish(Some(report)).await;
                     did_tick = true;
                 }
             }
@@ -230,6 +251,22 @@ impl PreloadEngine {
         self.services.repo.save(&snapshot).await
     }
 
+    /// Publica el estado del motor en `view` después de cada tick y de cada
+    /// evento de control.
+    pub fn publish_to(&mut self, view: Arc<RwLock<EngineView>>) {
+        self.view = Some(view);
+    }
+
+    async fn publish(&self, last_tick: Option<TickReport>) {
+        let Some(view) = &self.view else { return };
+        let mut view = view.write().await;
+        view.stores = self.stores.clone();
+        view.paused = self.paused;
+        if last_tick.is_some() {
+            view.last_tick = last_tick;
+        }
+    }
+
     /// Acceso de solo lectura a los almacenes (útil para tests).
     pub fn stores(&self) -> &Stores {
         &self.stores
@@ -248,6 +285,10 @@ impl PreloadEngine {
                 self.save().await?;
                 self.last_save = Instant::now();
                 info!("estado guardado");
+            }
+            ControlEvent::SetPaused(paused) => {
+                self.paused = paused;
+                info!(paused, "prefetch pausado/reanudado");
             }
         }
         Ok(())
@@ -392,13 +433,17 @@ impl PreloadEngine {
         }
 
         // Reconstruir conjunto activo basado en last_seen_time y ventana
-        for (exe_id, exe) in stores.exes.iter() {
-            if let Some(last_seen) = exe.last_seen_time
-                && stores.model_time.saturating_sub(last_seen) <= active_window
-            {
-                stores.active.update(&[exe_id], stores.model_time);
-            }
-        }
+        let active: Vec<_> = stores
+            .exes
+            .iter()
+            .filter(|(_, exe)| {
+                exe.last_seen_time.is_some_and(|last_seen| {
+                    stores.model_time.saturating_sub(last_seen) <= active_window
+                })
+            })
+            .map(|(exe_id, _)| exe_id)
+            .collect();
+        stores.active.update(&active, stores.model_time);
 
         for record in snapshot.state.exe_maps {
             let exe_key = ExeKey::new(PathBuf::from(record.exe_path));
@@ -791,5 +836,320 @@ mod tests {
         assert_eq!(cargado.stores.model_time, 500);
         assert_eq!(cargado.stores.maps.len(), 4);
         assert_eq!(ejecutables_con_mapas(&cargado.stores), esperado);
+    }
+
+    /// Escáner que informa siempre los mismos ejecutables, cada uno con un
+    /// mapa propio, y estadísticas de memoria (50 % libre): no depende de `/proc`.
+    struct FixedScanner(Vec<(&'static str, u32)>);
+
+    impl Scanner for FixedScanner {
+        fn scan(&mut self, time: u64, scan_id: u64) -> Result<Observation, Error> {
+            let mut events = vec![
+                ObservationEvent::ObsBegin { time, scan_id },
+                ObservationEvent::MemStat {
+                    mem: MemStat {
+                        total: 1000,
+                        free: 300,
+                        cached: 200,
+                        pagein: 0,
+                        pageout: 0,
+                    },
+                },
+            ];
+            for (path, pid) in &self.0 {
+                events.push(ObservationEvent::CandidateExe {
+                    exe: CandidateExe::new(path.into(), *pid),
+                });
+                events.push(ObservationEvent::Map {
+                    segment: MapSegment::new(format!("{path}.lib").into(), 0, 4096, time),
+                    pid: *pid,
+                });
+            }
+            events.push(ObservationEvent::ObsEnd {
+                time,
+                scan_id,
+                warnings: Vec::new(),
+            });
+            Ok(events)
+        }
+    }
+
+    /// Planificador que pide siempre el primer mapa que conozca.
+    struct FirstMapPlanner;
+
+    impl PrefetchPlanner for FirstMapPlanner {
+        fn plan(&self, _: &Prediction, stores: &Stores, _: &MemStat) -> PrefetchPlan {
+            let maps = stores
+                .maps
+                .iter()
+                .take(1)
+                .map(|(map_id, map)| crate::prefetch::PrefetchMap {
+                    map_id,
+                    map_key: map.key(),
+                    priority: 1.0,
+                    size: map.length,
+                })
+                .collect();
+            PrefetchPlan {
+                maps,
+                total_bytes: 4096,
+                budget_bytes: 4096,
+            }
+        }
+    }
+
+    /// Prefetcher que anota cuántos mapas tenía cada plan que recibió.
+    struct PlanLogPrefetcher(Arc<std::sync::Mutex<Vec<usize>>>);
+
+    #[async_trait]
+    impl Prefetcher for PlanLogPrefetcher {
+        async fn execute(&self, plan: &PrefetchPlan, _stores: &Stores) -> PrefetchReport {
+            self.0.lock().unwrap().push(plan.maps.len());
+            PrefetchReport::default()
+        }
+    }
+
+    /// Prefetcher que nunca termina: deja al motor clavado dentro del primer tick.
+    struct PendingPrefetcher;
+
+    #[async_trait]
+    impl Prefetcher for PendingPrefetcher {
+        async fn execute(&self, _plan: &PrefetchPlan, _stores: &Stores) -> PrefetchReport {
+            std::future::pending().await
+        }
+    }
+
+    /// Reloj cuyo sueño dura un milisegundo real: el motor no gira sin ceder el
+    /// hilo, y una prueba que falla termina por su `timeout` en lugar de colgarse.
+    struct BriefSleepClock;
+
+    #[async_trait]
+    impl crate::clock::Clock for BriefSleepClock {
+        fn now(&self) -> u64 {
+            0
+        }
+
+        async fn sleep(&self, _dur: Duration) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    fn scanning_services(prefetcher: Box<dyn Prefetcher + Send + Sync>) -> Services {
+        Services {
+            scanner: Box::new(FixedScanner(vec![
+                ("/usr/bin/bash", 1),
+                ("/usr/bin/vim", 2),
+            ])),
+            admission: Box::new(DefaultAdmissionPolicy::new(vec![], vec![], 100_000_000)),
+            updater: Box::new(DefaultModelUpdater::new()),
+            predictor: Box::new(crate::prediction::MarkovPredictor::new()),
+            planner: Box::new(FirstMapPlanner),
+            prefetcher,
+            repo: Box::new(NoopRepository),
+            clock: Box::new(BriefSleepClock),
+        }
+    }
+
+    #[tokio::test]
+    async fn con_el_motor_en_pausa_el_prefetcher_recibe_un_plan_vacio_y_al_reanudar_vuelve_a_recibir_mapas()
+     {
+        let plans = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let services = scanning_services(Box::new(PlanLogPrefetcher(plans.clone())));
+        let mut engine = PreloadEngine::new(Config::default(), services)
+            .await
+            .unwrap();
+
+        engine.tick().await.unwrap();
+        engine
+            .handle_control(ControlEvent::SetPaused(true))
+            .await
+            .unwrap();
+        engine.tick().await.unwrap();
+        engine
+            .handle_control(ControlEvent::SetPaused(false))
+            .await
+            .unwrap();
+        engine.tick().await.unwrap();
+
+        // Pausado sigue escaneando y modelando: lo único que se omite es el plan.
+        assert_eq!(*plans.lock().unwrap(), vec![1, 0, 1]);
+        assert_eq!(engine.stores.exes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn publicar_deja_en_la_vista_los_almacenes_el_ultimo_tick_y_la_pausa() {
+        let services = scanning_services(Box::new(NoopPrefetcher));
+        let mut engine = PreloadEngine::new(Config::default(), services)
+            .await
+            .unwrap();
+        // Sin vista, publicar no hace nada.
+        engine.publish(None).await;
+
+        let view = Arc::new(RwLock::new(EngineView::default()));
+        engine.publish_to(view.clone());
+        let report = engine.tick().await.unwrap();
+        engine.publish(Some(report)).await;
+        {
+            let v = view.read().await;
+            assert_eq!(v.stores.exes.len(), 2);
+            assert_eq!(v.stores.maps.len(), 2);
+            let tick = v.last_tick.as_ref().expect("último tick");
+            assert_eq!(tick.scan_id, 1);
+            assert_eq!(tick.model_delta.exes_added, 2);
+            assert_eq!(tick.memstat.map(|m| m.free_percent()), Some(50));
+            assert!(!v.paused);
+        }
+
+        // Un evento de control publica sin pisar el último tick.
+        engine
+            .handle_control(ControlEvent::SetPaused(true))
+            .await
+            .unwrap();
+        engine.publish(None).await;
+        let v = view.read().await;
+        assert!(v.paused);
+        assert_eq!(v.last_tick.as_ref().map(|t| t.scan_id), Some(1));
+    }
+
+    #[tokio::test]
+    async fn run_until_publica_al_arrancar_y_despues_de_un_evento_con_el_tick_trabado() {
+        let services = scanning_services(Box::new(PendingPrefetcher));
+        let mut engine = PreloadEngine::new(Config::default(), services)
+            .await
+            .unwrap();
+        engine.stores.model_time = 500;
+        engine
+            .stores
+            .ensure_exe(ExeKey::new("/usr/bin/cargado".into()));
+        let view = Arc::new(RwLock::new(EngineView::default()));
+        engine.publish_to(view.clone());
+
+        let cancel = CancellationToken::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { engine.run_until(cancel, rx).await }
+        });
+
+        // El primer tick nunca termina (el prefetcher no vuelve): lo que hay en
+        // la vista lo publicó el arranque.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while view.read().await.stores.exes.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("el motor no publicó al arrancar");
+        let v = view.read().await;
+        assert_eq!(v.stores.model_time, 500);
+        assert!(v.last_tick.is_none());
+        drop(v);
+
+        // Sin ningún tick que publique, la pausa sólo puede llegar a la vista
+        // por el evento de control.
+        tx.send(ControlEvent::SetPaused(true)).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !view.read().await.paused {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("el evento de control no se publicó");
+        assert!(view.read().await.last_tick.is_none());
+
+        cancel.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_until_publica_despues_de_cada_tick_y_de_cada_evento_de_control() {
+        let services = scanning_services(Box::new(NoopPrefetcher));
+        let mut engine = PreloadEngine::new(Config::default(), services)
+            .await
+            .unwrap();
+        let view = Arc::new(RwLock::new(EngineView::default()));
+        engine.publish_to(view.clone());
+
+        let cancel = CancellationToken::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { engine.run_until(cancel, rx).await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while view.read().await.last_tick.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("el motor no publicó ningún tick");
+        assert_eq!(view.read().await.stores.exes.len(), 2);
+
+        tx.send(ControlEvent::SetPaused(true)).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !view.read().await.paused {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("la pausa no llegó a la vista");
+
+        cancel.cancel();
+        task.await.unwrap().unwrap();
+        assert!(view.read().await.last_tick.is_some());
+    }
+
+    #[tokio::test]
+    async fn al_cargar_quedan_activos_todos_los_ejecutables_dentro_de_la_ventana() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ruta = dir.path().join("state.sqlite");
+        let mut config = Config::default();
+        config.modelo.ventana_activa = Duration::from_secs(100);
+
+        let repo = crate::persistence::SqliteRepository::new(&ruta)
+            .await
+            .unwrap();
+        let mut original = PreloadEngine::new(config.clone(), servicios_con_repo(repo))
+            .await
+            .unwrap();
+        {
+            let stores = &mut original.stores;
+            stores.model_time = 500;
+            // Tres dentro de la ventana (500 - last_seen <= 100), uno fuera y uno sin verse.
+            for (path, last_seen) in [
+                ("/usr/bin/bash", Some(490)),
+                ("/usr/bin/vim", Some(480)),
+                ("/usr/bin/zsh", Some(495)),
+                ("/usr/bin/viejo", Some(100)),
+                ("/usr/bin/nunca", None),
+            ] {
+                let id = stores.ensure_exe(ExeKey::new(path.into()));
+                stores.exes.get_mut(id).unwrap().last_seen_time = last_seen;
+            }
+        }
+        original.save().await.unwrap();
+
+        let repo = crate::persistence::SqliteRepository::new(&ruta)
+            .await
+            .unwrap();
+        let cargado = PreloadEngine::load(config, servicios_con_repo(repo))
+            .await
+            .unwrap();
+        let stores = &cargado.stores;
+
+        let path_of = |id| {
+            stores
+                .exes
+                .get(id)
+                .unwrap()
+                .key
+                .path()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let mut active: Vec<_> = stores.active.exes().into_iter().map(path_of).collect();
+        active.sort();
+        assert_eq!(active, ["/usr/bin/bash", "/usr/bin/vim", "/usr/bin/zsh"]);
     }
 }

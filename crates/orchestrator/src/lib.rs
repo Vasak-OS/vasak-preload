@@ -16,7 +16,7 @@ pub mod stores;
 pub use clock::{Clock, SystemClock};
 pub use config::Config;
 pub use domain::{Exe, ExeId, ExeKey, MapId, MapKey, MapSegment, MarkovEdge, MarkovState, MemStat};
-pub use engine::{ControlEvent, PreloadEngine, ReloadBundle, Services, TickReport};
+pub use engine::{ControlEvent, EngineView, PreloadEngine, ReloadBundle, Services, TickReport};
 pub use error::Error;
 pub use observation::{
     AdmissionDecision, AdmissionPolicy, AdmissionPolicyStats, CandidateExe, Completeness,

@@ -5,7 +5,7 @@
 use crate::domain::{ExeId, MapId};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ExeMapIndex {
     exe_to_maps: HashMap<ExeId, HashSet<MapId>>,
     map_to_exes: HashMap<MapId, HashSet<ExeId>>,

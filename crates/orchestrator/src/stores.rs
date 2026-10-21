@@ -19,7 +19,7 @@ pub use markov_graph::MarkovGraph;
 use crate::domain::{ExeId, ExeKey, MapId, MapSegment, MarkovState};
 use std::collections::HashSet;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Stores {
     pub exes: ExeStore,
     pub maps: MapStore,

@@ -5,7 +5,7 @@
 use crate::domain::{Exe, ExeId, ExeKey};
 use slotmap::SlotMap;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ExeStore {
     inner: SlotMap<ExeId, Exe>,
     by_key: std::collections::HashMap<ExeKey, ExeId>,
