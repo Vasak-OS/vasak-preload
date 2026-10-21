@@ -2,9 +2,9 @@
 
 #![allow(unsafe_code)]
 
+use serde::{Deserialize, Serialize, de, ser};
 use slotmap::{Key, KeyData};
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize, de, ser};
 
 /// Identificador único de un ejecutable.
 #[derive(Copy, Clone, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
@@ -13,13 +13,6 @@ pub struct ExeId(pub KeyData);
 impl From<KeyData> for ExeId {
     fn from(data: KeyData) -> Self {
         ExeId(data)
-    }
-}
-
-impl ExeId {
-    /// Obtiene el KeyData interno (accesible dentro del crate).
-    pub(crate) fn key_data(&self) -> KeyData {
-        self.0
     }
 }
 
@@ -37,13 +30,6 @@ pub struct MapId(pub KeyData);
 impl From<KeyData> for MapId {
     fn from(data: KeyData) -> Self {
         MapId(data)
-    }
-}
-
-impl MapId {
-    /// Obtiene el KeyData interno (accesible dentro del crate).
-    pub(crate) fn key_data(&self) -> KeyData {
-        self.0
     }
 }
 
@@ -115,6 +101,10 @@ pub struct MapKey {
 impl MapKey {
     /// Crea una nueva clave de mapeo.
     pub fn new(path: PathBuf, offset: u64, length: u64) -> Self {
-        Self { path, offset, length }
+        Self {
+            path,
+            offset,
+            length,
+        }
     }
 }
