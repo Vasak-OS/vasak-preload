@@ -10,11 +10,13 @@ members = [
 
 [workspace.package]
 edition = "2024"
-license = "Apache-2.0"
+# GPL-3.0: el escáner de /proc adapta la lógica de muestreo de vasak-monitor,
+# que es GPL-3.0, así que el derivado no puede publicarse con otra licencia.
+license = "GPL-3.0-only"
 authors = ["VasakOS Team <team@vasakos.org>"]
 repository = "https://github.com/Vasak-OS/vasak-preload"
 description = "System optimizer for VasakOS: prefetches binaries and libraries based on usage patterns"
-version = "0.1.4"
+version = "0.1.5"
 
 [workspace.dependencies]
 thiserror = "2.0.18"

@@ -1,7 +1,6 @@
 [Unit]
 Description=VasakOS Preload Daemon
-Documentation=https://github.com/VasakOS/vasak-preload
-After=network.target
+Documentation=https://github.com/Vasak-OS/vasak-preload
 ConditionPathExists=/etc/vasak-preload/config.toml
 
 [Service]
@@ -12,6 +11,10 @@ Restart=on-failure
 RestartSec=5
 User=vasak-preload
 Group=vasak-preload
+# Crea y da permiso de escritura a /var/lib/vasak-preload (donde vive
+# state.sqlite): sin esto, con ProtectSystem=strict el estado queda de sólo
+# lectura y el guardado falla.
+StateDirectory=vasak-preload
 # Seguridad
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -24,8 +27,9 @@ RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-# Acceso a /proc para escanear procesos
-ProcSubset=pid
+# El escáner lee /proc/meminfo para medir la presión de memoria, que queda
+# fuera de la vista con ProcSubset=pid; por eso se deja el /proc completo.
+ProcSubset=all
 # Capabilities mínimas
 AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE
