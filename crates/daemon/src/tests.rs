@@ -4,7 +4,7 @@
 //! modo peer-to-peer: no hace falta bus del sistema ni root. El cliente usa el
 //! mismo `PreloadProxy` que `vasak-preload-cli`.
 
-use crate::service::{ConfigSource, EngineTask, PreloadService};
+use crate::service::{ConfigSource, EngineTask, PreloadService, stats_from_view};
 use crate::{Args, OBJECT_PATH, config_source, run, serve, wait_for_shutdown};
 use clap::Parser;
 use std::path::Path;
@@ -13,7 +13,11 @@ use tempfile::TempDir;
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 use vasak_preload_config::Config;
-use vasak_preload_orchestrator::{ExeKey, MapSegment, SqliteRepository, StateRepository};
+use vasak_preload_orchestrator::{
+    CandidateExe, EngineView, Error as EngineError, ExeKey, MapSegment, MemStat, ModelDelta,
+    Observation, ObservationEvent, PredictionSummary, PrefetchReport, ProcfsScanner, Scanner,
+    SqliteRepository, StateRepository, TickReport,
+};
 use vasak_preload_protocol::{DaemonState, PreloadProxy};
 use zbus::proxy::CacheProperties;
 use zbus::{Connection, Guid, connection};
@@ -64,6 +68,14 @@ async fn start_daemon(config: Config) -> Daemon {
 /// Como `start_daemon`, con un servicio ya armado (por ejemplo, con otros archivos
 /// de configuración para `ReloadConfig`).
 async fn start_daemon_with(service: PreloadService) -> Daemon {
+    start_daemon_scanning(service, Box::new(ProcfsScanner::new())).await
+}
+
+/// Como `start_daemon_with`, con el escáner a elegir.
+async fn start_daemon_scanning(
+    service: PreloadService,
+    scanner: Box<dyn Scanner + Send + Sync>,
+) -> Daemon {
     let (lado_servidor, lado_cliente) = UnixStream::pair().expect("par de sockets");
 
     let servidor = connection::Builder::unix_stream(lado_servidor)
@@ -72,7 +84,7 @@ async fn start_daemon_with(service: PreloadService) -> Daemon {
         .p2p();
     let cliente = connection::Builder::unix_stream(lado_cliente).p2p().build();
 
-    let (servido, cliente) = tokio::join!(serve(servidor, service), cliente);
+    let (servido, cliente) = tokio::join!(serve(servidor, service, scanner), cliente);
     let (servidor, motor) = servido.expect("publicar el servicio y arrancar el motor");
     let cliente = cliente.expect("conectar el cliente");
 
@@ -165,18 +177,17 @@ async fn la_interfaz_publicada_ve_el_motor_que_corre() {
 
 #[tokio::test]
 async fn las_estadisticas_llegan_por_d_bus_con_sus_valores_de_ausencia() {
+    // Sin motor no hay ticks: con uno corriendo, el primero ya los llena.
     let dir = TempDir::new().unwrap();
-    let daemon = start_daemon(config_de_prueba(dir.path())).await;
+    let (_servidor, _cliente, proxy) = publicar_sin_motor(config_de_prueba(dir.path())).await;
 
-    let stats = daemon.proxy.stats().await.unwrap();
+    let stats = proxy.stats().await.unwrap();
     assert_eq!(stats.last_tick_scan_id, 0, "0 = todavía sin ticks");
     assert_eq!(
         stats.last_tick_mem_free_pct, 255,
         "255 = sin dato de memoria"
     );
     assert_eq!(stats.last_tick_prediction_max_prob, 0.0);
-
-    apagar(daemon.motor).await;
 }
 
 #[tokio::test]
@@ -350,8 +361,9 @@ async fn poblar_almacenes(servidor: &Connection) {
         .interface::<_, PreloadService>(OBJECT_PATH)
         .await
         .expect("servicio publicado");
-    let stores = servicio.get().await.stores();
-    let mut stores = stores.write().await;
+    let view = servicio.get().await.view();
+    let mut view = view.write().await;
+    let stores = &mut view.stores;
 
     let bash = stores.ensure_exe(ExeKey::new("/usr/bin/bash".into()));
     let vim = stores.ensure_exe(ExeKey::new("/usr/bin/vim".into()));
@@ -516,10 +528,12 @@ async fn sigterm_y_sigint_terminan_la_espera_de_apagado() {
 
 #[tokio::test]
 async fn recargar_con_el_motor_corriendo_reemplaza_la_configuracion() {
-    // `ReloadConfig` lee los `*.toml` del directorio temporal, que no tiene
-    // ninguno, así que carga los valores por omisión, que no traen 4321. No
-    // depende de la configuración de la máquina.
+    // `ReloadConfig` lee los `*.toml` del directorio temporal: uno solo, con
+    // ciclo de 1 s (con el de 20 s por omisión el apagado del motor tarda
+    // ciclos enteros) y sin `ventana_activa`, que vuelve a su valor por omisión.
+    // No depende de la configuración de la máquina.
     let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "[modelo]\nciclo = 1\n").unwrap();
     let mut config = config_de_prueba(dir.path());
     config.modelo.ventana_activa = Duration::from_secs(4321);
     let service = PreloadService::new(config, ConfigSource::Dir(dir.path().to_path_buf()))
@@ -668,4 +682,237 @@ fn los_argumentos_eligen_de_donde_se_lee_la_configuracion() {
         ]),
         ConfigSource::File("/srv/preload.toml".into())
     );
+}
+
+/// Escáner que informa siempre `bash` (con dos mapas) y `vim`, y 50 % de
+/// memoria libre: el motor del daemon lo usa en lugar de leer `/proc`.
+struct FixedScanner;
+
+impl Scanner for FixedScanner {
+    fn scan(&mut self, time: u64, scan_id: u64) -> Result<Observation, EngineError> {
+        let map = |path: &str, pid| ObservationEvent::Map {
+            segment: MapSegment::new(path.into(), 0, 4096, time),
+            pid,
+        };
+        Ok(vec![
+            ObservationEvent::ObsBegin { time, scan_id },
+            ObservationEvent::MemStat {
+                mem: MemStat {
+                    total: 1000,
+                    free: 300,
+                    cached: 200,
+                    pagein: 0,
+                    pageout: 0,
+                },
+            },
+            ObservationEvent::CandidateExe {
+                exe: CandidateExe::new("/usr/bin/bash".into(), 1),
+            },
+            map("/usr/lib/libc.so.6", 1),
+            map("/usr/lib/libreadline.so.8", 1),
+            ObservationEvent::CandidateExe {
+                exe: CandidateExe::new("/usr/bin/vim".into(), 2),
+            },
+            ObservationEvent::ObsEnd {
+                time,
+                scan_id,
+                warnings: Vec::new(),
+            },
+        ])
+    }
+}
+
+#[tokio::test]
+async fn la_interfaz_informa_lo_que_el_motor_observo() {
+    let dir = TempDir::new().unwrap();
+    let mut config = config_de_prueba(dir.path());
+    config.sistema.doscan = true;
+    config.sistema.dopredict = true;
+    let service = PreloadService::new(config, ConfigSource::Default)
+        .await
+        .expect("servicio");
+    let daemon = start_daemon_scanning(service, Box::new(FixedScanner)).await;
+
+    // El motor publica al terminar cada tick: se espera al primero.
+    let stats = timeout(APAGADO_MAXIMO, async {
+        loop {
+            let stats = daemon.proxy.stats().await.unwrap();
+            if stats.last_tick_scan_id != 0 {
+                break stats;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("el motor no llegó a publicar un tick");
+
+    assert_eq!(stats.state, DaemonState::Running);
+    assert_eq!(stats.exe_count, 2);
+    assert_eq!(stats.map_count, 2);
+    assert!(stats.scan_count >= 1);
+    assert_eq!(stats.last_tick_exes_added, 2);
+    assert_eq!(stats.last_tick_maps_added, 2);
+    assert_eq!(stats.last_tick_prediction_exes, 2);
+    assert!(stats.last_tick_prediction_max_prob > 0.0);
+    assert_eq!(stats.last_tick_mem_free_pct, 50);
+
+    let top = daemon.proxy.get_top_predictions(5).await.unwrap();
+    let mut paths: Vec<_> = top.iter().map(|(path, _)| path.as_str()).collect();
+    paths.sort();
+    assert_eq!(paths, ["/usr/bin/bash", "/usr/bin/vim"]);
+    assert!(top.iter().all(|(_, prob)| *prob > 0.0));
+
+    let bash = daemon.proxy.get_exe_state("/usr/bin/bash").await.unwrap();
+    assert!(bash.has_value);
+    assert!(bash.inner.running);
+    assert_eq!(bash.inner.map_count, 2);
+    assert!(bash.inner.prediction_probability > 0.0);
+
+    apagar(daemon.motor).await;
+}
+
+#[tokio::test]
+async fn pausar_llega_al_motor_y_reanudar_lo_revierte() {
+    let dir = TempDir::new().unwrap();
+    let service = PreloadService::new(config_de_prueba(dir.path()), ConfigSource::Default)
+        .await
+        .expect("servicio");
+    let daemon = start_daemon_scanning(service, Box::new(FixedScanner)).await;
+    let view = daemon
+        ._servidor
+        .object_server()
+        .interface::<_, PreloadService>(OBJECT_PATH)
+        .await
+        .unwrap()
+        .get()
+        .await
+        .view();
+    let wait_for_paused = |expected: bool| {
+        let view = view.clone();
+        async move {
+            timeout(APAGADO_MAXIMO, async {
+                while view.read().await.paused != expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("el motor no cambió su pausa")
+        }
+    };
+
+    daemon.proxy.pause().await.unwrap();
+    wait_for_paused(true).await;
+    daemon.proxy.resume().await.unwrap();
+    wait_for_paused(false).await;
+
+    apagar(daemon.motor).await;
+}
+
+#[tokio::test]
+async fn pausar_o_reanudar_sin_motor_falla_y_no_cambia_el_estado() {
+    let dir = TempDir::new().unwrap();
+    let (_servidor, _cliente, proxy) = publicar_sin_motor(config_de_prueba(dir.path())).await;
+    assert_eq!(proxy.state().await.unwrap(), DaemonState::Starting);
+
+    for error in [
+        proxy.pause().await.unwrap_err(),
+        proxy.resume().await.unwrap_err(),
+    ] {
+        assert!(
+            es_failed(&error),
+            "se esperaba Error.Failed, llegó {error:?}"
+        );
+        assert_eq!(proxy.state().await.unwrap(), DaemonState::Starting);
+    }
+}
+
+fn full_tick() -> TickReport {
+    TickReport {
+        scan_id: 7,
+        model_delta: ModelDelta {
+            exes_added: 1,
+            maps_added: 2,
+            edges_added: 3,
+            edges_updated: 4,
+        },
+        prediction: PredictionSummary {
+            total_exes: 5,
+            max_probability: 0.5,
+            time: 99,
+        },
+        prefetch: PrefetchReport {
+            attempted: 6,
+            succeeded: 5,
+            failed: 1,
+            bytes_prefetched: 1 << 33,
+            errors: Vec::new(),
+        },
+        memstat: Some(MemStat {
+            total: 1000,
+            free: 300,
+            cached: 200,
+            pagein: 0,
+            pageout: 0,
+        }),
+    }
+}
+
+#[test]
+fn sin_ultimo_tick_las_estadisticas_dejan_los_valores_de_ausencia() {
+    let stats = stats_from_view(DaemonState::Paused, &EngineView::default());
+
+    assert_eq!(stats.state, DaemonState::Paused);
+    assert_eq!(stats.scan_count, 0);
+    assert_eq!(stats.exe_count, 0);
+    assert_eq!(stats.last_tick_scan_id, 0);
+    assert_eq!(stats.last_tick_mem_free_pct, 255);
+}
+
+#[test]
+fn las_estadisticas_toman_los_contadores_de_los_almacenes_y_del_ultimo_tick() {
+    let mut view = EngineView::default();
+    view.stores.model_time = 42;
+    let bash = view.stores.ensure_exe(ExeKey::new("/usr/bin/bash".into()));
+    view.stores.ensure_exe(ExeKey::new("/usr/bin/vim".into()));
+    let libc = view
+        .stores
+        .ensure_map(MapSegment::new("/usr/lib/libc.so.6".into(), 0, 4096, 1));
+    view.stores.attach_map(bash, libc);
+    view.stores.active.update(&[bash], 42);
+    view.last_tick = Some(full_tick());
+
+    let stats = stats_from_view(DaemonState::Running, &view);
+
+    assert_eq!(stats.state, DaemonState::Running);
+    assert_eq!(stats.exe_count, 2);
+    assert_eq!(stats.map_count, 1);
+    assert_eq!(stats.active_count, 1);
+    assert_eq!(stats.model_time, 42);
+    assert_eq!(stats.scan_count, 7);
+    assert_eq!(stats.last_tick_scan_id, 7);
+    assert_eq!(stats.last_tick_exes_added, 1);
+    assert_eq!(stats.last_tick_maps_added, 2);
+    assert_eq!(stats.last_tick_edges_added, 3);
+    assert_eq!(stats.last_tick_edges_updated, 4);
+    assert_eq!(stats.last_tick_prediction_exes, 5);
+    assert_eq!(stats.last_tick_prediction_max_prob, 0.5);
+    assert_eq!(stats.last_tick_prefetch_attempted, 6);
+    assert_eq!(stats.last_tick_prefetch_succeeded, 5);
+    assert_eq!(stats.last_tick_prefetch_failed, 1);
+    assert_eq!(stats.last_tick_prefetch_bytes, 1 << 33);
+    assert_eq!(stats.last_tick_mem_free_pct, 50);
+}
+
+#[test]
+fn un_tick_sin_datos_de_memoria_deja_el_porcentaje_en_255() {
+    let mut view = EngineView::default();
+    view.last_tick = Some(TickReport {
+        memstat: None,
+        ..full_tick()
+    });
+
+    let stats = stats_from_view(DaemonState::Running, &view);
+
+    assert_eq!(stats.last_tick_scan_id, 7);
+    assert_eq!(stats.last_tick_mem_free_pct, 255);
 }

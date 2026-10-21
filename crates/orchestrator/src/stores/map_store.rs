@@ -5,7 +5,7 @@
 use crate::domain::{MapId, MapKey, MapSegment};
 use slotmap::SlotMap;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MapStore {
     inner: SlotMap<MapId, MapSegment>,
     by_key: std::collections::HashMap<MapKey, MapId>,

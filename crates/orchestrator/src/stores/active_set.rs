@@ -5,7 +5,7 @@
 use crate::domain::ExeId;
 use std::collections::HashSet;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ActiveSet {
     exes: HashSet<ExeId>,
     last_update: u64,
