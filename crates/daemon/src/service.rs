@@ -230,15 +230,19 @@ impl PreloadService {
     }
 
     async fn pause(&self) -> zbus::fdo::Result<()> {
+        // El candado cubre el envío y la escritura: con Pause y Resume a la vez,
+        // el estado queda en el mismo orden que los eventos que recibe el motor.
+        let mut state = self.state.lock().await;
         self.send(ControlEvent::SetPaused(true)).await?;
-        *self.state.lock().await = DaemonState::Paused;
+        *state = DaemonState::Paused;
         info!("Prefetch pausado");
         Ok(())
     }
 
     async fn resume(&self) -> zbus::fdo::Result<()> {
+        let mut state = self.state.lock().await;
         self.send(ControlEvent::SetPaused(false)).await?;
-        *self.state.lock().await = DaemonState::Running;
+        *state = DaemonState::Running;
         info!("Prefetch reanudado");
         Ok(())
     }
