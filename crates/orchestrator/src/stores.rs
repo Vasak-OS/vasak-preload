@@ -28,6 +28,11 @@ pub struct Stores {
     pub active: ActiveSet,
     pub model_time: u64,
     pub last_accounting_time: u64,
+    /// El conjunto activo se reconstruyó al cargar (ejecutables vistos en la
+    /// ventana), no se observó corriendo. El primer tick tras cargar no debe
+    /// tomarlo como «corría antes» o inventa transiciones; el updater lo
+    /// consume en ese tick.
+    pub active_reconstructed: bool,
 }
 
 impl Stores {

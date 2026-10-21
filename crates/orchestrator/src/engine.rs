@@ -393,6 +393,7 @@ impl PreloadEngine {
                 time_to_leave: edge.time_to_leave,
                 transition_prob: edge.transition_prob,
                 both_running_time: edge.both_running_time,
+                observations: edge.observations,
             });
         }
 
@@ -456,6 +457,9 @@ impl PreloadEngine {
             .map(|(exe_id, _)| exe_id)
             .collect();
         stores.active.update(&active, stores.model_time);
+        // Está reconstruido desde la ventana, no observado corriendo: el primer
+        // tick no debe inferir transiciones a partir de él.
+        stores.active_reconstructed = true;
 
         for record in snapshot.state.exe_maps {
             let exe_key = ExeKey::new(PathBuf::from(record.exe_path));
@@ -496,6 +500,7 @@ impl PreloadEngine {
                 edge.time_to_leave = record.time_to_leave;
                 edge.transition_prob = record.transition_prob;
                 edge.both_running_time = record.both_running_time;
+                edge.observations = record.observations;
             }
         }
 
@@ -1330,10 +1335,11 @@ mod tests {
         let (a, b) = (id_of("/usr/bin/a"), id_of("/usr/bin/b"));
         assert!(!stores.exes.get(b).unwrap().running);
         let prediction = crate::prediction::MarkovPredictor::new().predict(stores);
-        // P(sólo A -> ambos) vale 0.1 tras la primera vez y 0.19 tras la segunda;
-        // por el decaimiento de 0.95 queda 0.1805, y no hace falta normalizar.
-        assert!((prediction.get_probability(b) - 0.1805).abs() < 1e-4);
-        assert!((prediction.get_probability(a) - 0.8).abs() < 1e-6);
+        // Como frecuencia, P(sólo A -> ambos) ya vale 1 (B arrancó las dos veces
+        // que A estuvo solo): ×0.95 de decaimiento da 0.95 para B. Con A en 0.8
+        // la suma pasa de 1 y se normaliza: cada uno sobre 1.75.
+        assert!((prediction.get_probability(b) - 0.95 / 1.75).abs() < 1e-4);
+        assert!((prediction.get_probability(a) - 0.8 / 1.75).abs() < 1e-4);
     }
 
     #[tokio::test]

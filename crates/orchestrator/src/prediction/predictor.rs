@@ -8,10 +8,18 @@ use crate::stores::Stores;
 use std::collections::HashMap;
 
 /// Predictor que usa el modelo de Markov para predecir próximos ejecutables.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MarkovPredictor {
     /// Factor de decaimiento para predicciones antiguas.
     decay_factor: f32,
+}
+
+impl Default for MarkovPredictor {
+    fn default() -> Self {
+        // `derive(Default)` dejaba `decay_factor = 0.0`, un predictor que nunca
+        // daba probabilidad por arista. El default es el mismo que `new`.
+        Self::new()
+    }
 }
 
 impl MarkovPredictor {
@@ -158,6 +166,16 @@ mod tests {
             approx(prediction.get_probability(running), 0.8);
             approx(prediction.get_probability(idle), 0.1 * 0.95);
         }
+    }
+
+    #[test]
+    fn el_predictor_por_defecto_tambien_predice_por_arista() {
+        // `default()` tenía decay 0.0 y nunca daba probabilidad por arista.
+        let (stores, _, idle) = running_next_to_idle(false, 0.1, 0.0);
+        let p = MarkovPredictor::default()
+            .predict(&stores)
+            .get_probability(idle);
+        approx(p, 0.1 * 0.95);
     }
 
     #[test]
