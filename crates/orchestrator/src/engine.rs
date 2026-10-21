@@ -838,39 +838,55 @@ mod tests {
         assert_eq!(ejecutables_con_mapas(&cargado.stores), esperado);
     }
 
-    /// Escáner que informa siempre los mismos ejecutables, cada uno con un
-    /// mapa propio, y estadísticas de memoria (50 % libre): no depende de `/proc`.
+    /// Observación de un escaneo en el que corren `exes`, cada uno con un mapa
+    /// propio, y 50 % de memoria libre.
+    fn fake_observation(time: u64, scan_id: u64, exes: &[(&str, u32)]) -> Observation {
+        let mut events = vec![
+            ObservationEvent::ObsBegin { time, scan_id },
+            ObservationEvent::MemStat {
+                mem: MemStat {
+                    total: 1000,
+                    free: 300,
+                    cached: 200,
+                    pagein: 0,
+                    pageout: 0,
+                },
+            },
+        ];
+        for (path, pid) in exes {
+            events.push(ObservationEvent::CandidateExe {
+                exe: CandidateExe::new(path.into(), *pid),
+            });
+            events.push(ObservationEvent::Map {
+                segment: MapSegment::new(format!("{path}.lib").into(), 0, 4096, time),
+                pid: *pid,
+            });
+        }
+        events.push(ObservationEvent::ObsEnd {
+            time,
+            scan_id,
+            warnings: Vec::new(),
+        });
+        events
+    }
+
+    /// Escáner que informa siempre los mismos ejecutables: no depende de `/proc`.
     struct FixedScanner(Vec<(&'static str, u32)>);
 
     impl Scanner for FixedScanner {
         fn scan(&mut self, time: u64, scan_id: u64) -> Result<Observation, Error> {
-            let mut events = vec![
-                ObservationEvent::ObsBegin { time, scan_id },
-                ObservationEvent::MemStat {
-                    mem: MemStat {
-                        total: 1000,
-                        free: 300,
-                        cached: 200,
-                        pagein: 0,
-                        pageout: 0,
-                    },
-                },
-            ];
-            for (path, pid) in &self.0 {
-                events.push(ObservationEvent::CandidateExe {
-                    exe: CandidateExe::new(path.into(), *pid),
-                });
-                events.push(ObservationEvent::Map {
-                    segment: MapSegment::new(format!("{path}.lib").into(), 0, 4096, time),
-                    pid: *pid,
-                });
-            }
-            events.push(ObservationEvent::ObsEnd {
-                time,
-                scan_id,
-                warnings: Vec::new(),
-            });
-            Ok(events)
+            Ok(fake_observation(time, scan_id, &self.0))
+        }
+    }
+
+    /// Escáner con un guion: en el escaneo N corren los ejecutables del paso N
+    /// (el último se repite).
+    struct ScriptedScanner(Vec<Vec<(&'static str, u32)>>);
+
+    impl Scanner for ScriptedScanner {
+        fn scan(&mut self, time: u64, scan_id: u64) -> Result<Observation, Error> {
+            let step = (scan_id as usize - 1).min(self.0.len() - 1);
+            Ok(fake_observation(time, scan_id, &self.0[step]))
         }
     }
 
@@ -934,12 +950,12 @@ mod tests {
         }
     }
 
-    fn scanning_services(prefetcher: Box<dyn Prefetcher + Send + Sync>) -> Services {
+    fn services_with_scanner(
+        scanner: Box<dyn Scanner + Send + Sync>,
+        prefetcher: Box<dyn Prefetcher + Send + Sync>,
+    ) -> Services {
         Services {
-            scanner: Box::new(FixedScanner(vec![
-                ("/usr/bin/bash", 1),
-                ("/usr/bin/vim", 2),
-            ])),
+            scanner,
             admission: Box::new(DefaultAdmissionPolicy::new(vec![], vec![], 100_000_000)),
             updater: Box::new(DefaultModelUpdater::new()),
             predictor: Box::new(crate::prediction::MarkovPredictor::new()),
@@ -948,6 +964,11 @@ mod tests {
             repo: Box::new(NoopRepository),
             clock: Box::new(BriefSleepClock),
         }
+    }
+
+    fn scanning_services(prefetcher: Box<dyn Prefetcher + Send + Sync>) -> Services {
+        let scanner = FixedScanner(vec![("/usr/bin/bash", 1), ("/usr/bin/vim", 2)]);
+        services_with_scanner(Box::new(scanner), prefetcher)
     }
 
     #[tokio::test]
@@ -1160,23 +1181,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Primer tick: no había ejecutables activos, así que no hay con quién unir.
+        // Corren juntos desde el primer escaneo: la arista se crea ahí, una
+        // sola vez, y cada tick la observa una vez.
         let first = engine.tick().await.unwrap();
-        assert_eq!(first.model_delta.edges_added, 0);
-        assert_eq!(engine.stores.markov.len(), 0);
-
-        // Segundo: ya eran activos; la arista (bash, vim) se crea una sola vez
-        // aunque el par se recorra en los dos órdenes.
-        let second = engine.tick().await.unwrap();
-        assert_eq!(second.model_delta.edges_added, 1);
-        assert_eq!(second.model_delta.edges_updated, 1);
+        assert_eq!(first.model_delta.edges_added, 1);
+        assert_eq!(first.model_delta.edges_updated, 1);
         assert_eq!(engine.stores.markov.len(), 1);
 
-        // Tercero: la arista ya existe y no se duplica.
-        let third = engine.tick().await.unwrap();
-        assert_eq!(third.model_delta.edges_added, 0);
-        assert_eq!(third.model_delta.edges_updated, 2);
-        assert_eq!(engine.stores.markov.len(), 1);
+        for (tick, together) in [(2, 20), (3, 40)] {
+            let report = engine.tick().await.unwrap();
+            assert_eq!(report.scan_id, tick);
+            assert_eq!(report.model_delta.edges_added, 0);
+            assert_eq!(report.model_delta.edges_updated, 1);
+            assert_eq!(engine.stores.markov.len(), 1);
+            // Cada tick avanza un ciclo (20 s) del modelo.
+            let (_, edge) = engine.stores.markov.iter().next().unwrap();
+            assert_eq!(edge.both_running_time, together);
+        }
 
         let stores = &engine.stores;
         let (key, _) = stores.markov.iter().next().unwrap();
@@ -1190,6 +1211,42 @@ mod tests {
                 PathBuf::from("/usr/bin/vim")
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn tras_verlos_arrancar_juntos_el_motor_predice_el_que_no_corre() {
+        // A solo, A+B, A solo, A+B, A solo.
+        let steps = vec![
+            vec![("/usr/bin/a", 1)],
+            vec![("/usr/bin/a", 1), ("/usr/bin/b", 2)],
+            vec![("/usr/bin/a", 1)],
+            vec![("/usr/bin/a", 1), ("/usr/bin/b", 2)],
+            vec![("/usr/bin/a", 1)],
+        ];
+        let services =
+            services_with_scanner(Box::new(ScriptedScanner(steps)), Box::new(NoopPrefetcher));
+        let mut engine = PreloadEngine::new(Config::default(), services)
+            .await
+            .unwrap();
+
+        let first = engine.tick().await.unwrap();
+        assert_eq!(first.prediction.total_exes, 1, "sólo A, y nada aprendido");
+        let mut last = first;
+        for _ in 1..5 {
+            last = engine.tick().await.unwrap();
+        }
+
+        // Al final sólo A corre, pero B aparece en la predicción del tick.
+        assert_eq!(last.prediction.total_exes, 2);
+        let stores = &engine.stores;
+        let id_of = |path: &str| stores.exes.id_by_key(&ExeKey::new(path.into())).unwrap();
+        let (a, b) = (id_of("/usr/bin/a"), id_of("/usr/bin/b"));
+        assert!(!stores.exes.get(b).unwrap().running);
+        let prediction = crate::prediction::MarkovPredictor::new().predict(stores);
+        // P(sólo A -> ambos) vale 0.1 tras la primera vez y 0.19 tras la segunda;
+        // por el decaimiento de 0.95 queda 0.1805, y no hace falta normalizar.
+        assert!((prediction.get_probability(b) - 0.1805).abs() < 1e-4);
+        assert!((prediction.get_probability(a) - 0.8).abs() < 1e-6);
     }
 
     #[tokio::test]
