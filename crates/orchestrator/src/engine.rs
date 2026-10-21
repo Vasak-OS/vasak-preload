@@ -1152,4 +1152,105 @@ mod tests {
         active.sort();
         assert_eq!(active, ["/usr/bin/bash", "/usr/bin/vim", "/usr/bin/zsh"]);
     }
+
+    #[tokio::test]
+    async fn dos_ejecutables_que_corren_juntos_quedan_unidos_por_una_sola_arista() {
+        let services = scanning_services(Box::new(NoopPrefetcher));
+        let mut engine = PreloadEngine::new(Config::default(), services)
+            .await
+            .unwrap();
+
+        // Primer tick: no había ejecutables activos, así que no hay con quién unir.
+        let first = engine.tick().await.unwrap();
+        assert_eq!(first.model_delta.edges_added, 0);
+        assert_eq!(engine.stores.markov.len(), 0);
+
+        // Segundo: ya eran activos; la arista (bash, vim) se crea una sola vez
+        // aunque el par se recorra en los dos órdenes.
+        let second = engine.tick().await.unwrap();
+        assert_eq!(second.model_delta.edges_added, 1);
+        assert_eq!(second.model_delta.edges_updated, 1);
+        assert_eq!(engine.stores.markov.len(), 1);
+
+        // Tercero: la arista ya existe y no se duplica.
+        let third = engine.tick().await.unwrap();
+        assert_eq!(third.model_delta.edges_added, 0);
+        assert_eq!(third.model_delta.edges_updated, 2);
+        assert_eq!(engine.stores.markov.len(), 1);
+
+        let stores = &engine.stores;
+        let (key, _) = stores.markov.iter().next().unwrap();
+        let mut paths =
+            [key.a(), key.b()].map(|id| stores.exes.get(id).unwrap().key.path().to_path_buf());
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("/usr/bin/bash"),
+                PathBuf::from("/usr/bin/vim")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn al_cargar_se_conservan_las_aristas_entre_activos_con_sus_campos_y_se_podan_las_de_inactivos()
+     {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ruta = dir.path().join("state.sqlite");
+        let mut config = Config::default();
+        config.modelo.ventana_activa = Duration::from_secs(100);
+
+        let repo = crate::persistence::SqliteRepository::new(&ruta)
+            .await
+            .unwrap();
+        let mut original = PreloadEngine::new(config.clone(), servicios_con_repo(repo))
+            .await
+            .unwrap();
+        {
+            let stores = &mut original.stores;
+            stores.model_time = 500;
+            let mut id = |path: &str, last_seen| {
+                let id = stores.ensure_exe(ExeKey::new(path.into()));
+                stores.exes.get_mut(id).unwrap().last_seen_time = Some(last_seen);
+                id
+            };
+            let bash = id("/usr/bin/bash", 490);
+            let vim = id("/usr/bin/vim", 480);
+            let zsh = id("/usr/bin/zsh", 495);
+            let viejo = id("/usr/bin/viejo", 100);
+
+            for (a, b) in [(bash, vim), (bash, zsh), (bash, viejo)] {
+                stores.ensure_markov_edge(a, b, 500, MarkovState::Neither);
+            }
+            let edge = stores.markov.get_mut(EdgeKey::new(vim, bash)).unwrap();
+            edge.time_to_leave = [1.5, 2.5, 3.5, 4.5];
+            edge.transition_prob[2][3] = 0.25;
+            edge.both_running_time = 321;
+        }
+        original.save().await.unwrap();
+
+        let repo = crate::persistence::SqliteRepository::new(&ruta)
+            .await
+            .unwrap();
+        let cargado = PreloadEngine::load(config, servicios_con_repo(repo))
+            .await
+            .unwrap();
+        let stores = &cargado.stores;
+
+        let id_of = |path: &str| stores.exes.id_by_key(&ExeKey::new(path.into())).unwrap();
+        let (bash, vim, zsh, viejo) = (
+            id_of("/usr/bin/bash"),
+            id_of("/usr/bin/vim"),
+            id_of("/usr/bin/zsh"),
+            id_of("/usr/bin/viejo"),
+        );
+        assert_eq!(stores.markov.len(), 2);
+        assert!(stores.markov.get(EdgeKey::new(bash, zsh)).is_some());
+        assert!(stores.markov.get(EdgeKey::new(bash, viejo)).is_none());
+
+        let edge = stores.markov.get(EdgeKey::new(bash, vim)).unwrap();
+        assert_eq!(edge.time_to_leave, [1.5, 2.5, 3.5, 4.5]);
+        assert_eq!(edge.transition_prob[2][3], 0.25);
+        assert_eq!(edge.both_running_time, 321);
+    }
 }
