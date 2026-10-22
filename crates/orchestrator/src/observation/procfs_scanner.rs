@@ -15,8 +15,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Escáner que lee /proc para obtener procesos y sus mapeos.
 #[derive(Debug, Default)]
 pub struct ProcfsScanner {
-    /// Caché de tamaño de página del sistema.
-    page_size: Option<u64>,
     /// Último tiempo de muestreo para calcular deltas.
     last_sample_time: Option<u64>,
     /// Últimas estadísticas de memoria.
@@ -29,26 +27,19 @@ impl ProcfsScanner {
         Self::default()
     }
 
-    /// Obtiene el tamaño de página del sistema.
-    fn page_size(&self) -> u64 {
-        if let Some(ps) = self.page_size {
-            return ps;
-        }
-        // Leer de /proc/sys/vm/page_size o usar valor por defecto
-        let ps = std::fs::read_to_string("/proc/sys/vm/page_size")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(4096);
-        // Note: we don't cache here to avoid &mut self, but it's fine since page size doesn't change
-        ps
-    }
-
     /// Lee estadísticas de memoria de /proc/meminfo.
     fn read_memstat(&self) -> Result<MemStat, Error> {
         let content = std::fs::read_to_string("/proc/meminfo")?;
+        Ok(Self::parse_meminfo(&content))
+    }
+
+    /// Interpreta el contenido de `/proc/meminfo`: los valores vienen en kB y
+    /// se devuelven en bytes.
+    fn parse_meminfo(content: &str) -> MemStat {
         let mut total = 0u64;
         let mut free = 0u64;
         let mut cached = 0u64;
+        let mut available = 0u64;
 
         for line in content.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -60,18 +51,19 @@ impl ProcfsScanner {
                 "MemTotal:" => total = value,
                 "MemFree:" => free = value,
                 "Cached:" => cached = value,
+                "MemAvailable:" => available = value,
                 _ => {}
             }
         }
 
-        let page_size = self.page_size();
-        Ok(MemStat {
-            total: total / page_size,
-            free: free / page_size,
-            cached: cached / page_size,
+        MemStat {
+            total,
+            free,
+            cached,
+            available,
             pagein: 0, // Se calcula por delta
             pageout: 0,
-        })
+        }
     }
 
     /// Calcula pagein/pageout por delta desde última lectura.
@@ -395,7 +387,7 @@ mod tests {
     fn los_segmentos_del_propio_ejecutable_caen_dentro_del_archivo() {
         let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
         let file_size = std::fs::metadata(&exe).unwrap().len();
-        let page = ProcfsScanner::new().page_size();
+        let page = procfs::page_size();
         let events = ProcfsScanner::new().scan(0, 1).unwrap();
 
         let mine = events
@@ -435,5 +427,55 @@ mod tests {
             mine.total_size,
             mine.maps.iter().map(|m| m.length).sum::<u64>()
         );
+    }
+
+    const SAMPLE_MEMINFO: &str = "MemTotal:       16384000 kB
+MemFree:         2048000 kB
+MemAvailable:    8192000 kB
+Buffers:          100000 kB
+Cached:          4096000 kB
+SwapCached:            0 kB
+HugePages_Total:       0
+";
+
+    #[test]
+    fn meminfo_se_interpreta_en_bytes_y_con_la_memoria_disponible() {
+        let mem = ProcfsScanner::parse_meminfo(SAMPLE_MEMINFO);
+
+        assert_eq!(mem.total, 16_384_000 * 1024);
+        assert_eq!(mem.free, 2_048_000 * 1024);
+        assert_eq!(mem.cached, 4_096_000 * 1024);
+        // `MemAvailable`, no free + cached (que serían 6 144 000 kB).
+        assert_eq!(mem.available, 8_192_000 * 1024);
+        assert_eq!((mem.pagein, mem.pageout), (0, 0));
+        assert_eq!(mem.free_percent(), 50);
+    }
+
+    #[test]
+    fn meminfo_ignora_lineas_incompletas_y_valores_ilegibles() {
+        let mem = ProcfsScanner::parse_meminfo(
+            "MemTotal: 1000 kB\n\nsolo\nMemFree: abc kB\nMemAvailable: 400 kB\n",
+        );
+
+        assert_eq!(mem.total, 1000 * 1024);
+        assert_eq!(mem.free, 0);
+        assert_eq!(mem.available, 400 * 1024);
+    }
+
+    #[test]
+    fn sin_memavailable_la_disponible_queda_en_cero() {
+        let mem = ProcfsScanner::parse_meminfo("MemTotal: 1000 kB\nMemFree: 900 kB\n");
+
+        assert_eq!(mem.available, 0);
+    }
+
+    #[test]
+    fn la_memoria_del_sistema_se_lee_en_bytes() {
+        let mem = ProcfsScanner::new().read_memstat().unwrap();
+
+        // Páginas serían unos 4 millones; bytes, más de 64 MiB en cualquier máquina.
+        assert!(mem.total > 64 << 20, "total {}", mem.total);
+        assert_eq!(mem.total % 1024, 0);
+        assert!(mem.available > 0 && mem.available <= mem.total);
     }
 }
