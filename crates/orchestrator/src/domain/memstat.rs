@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Estadísticas de memoria del sistema (en bytes, como `/proc/meminfo`).
+/// Estadísticas de memoria del sistema, en bytes (`/proc/meminfo` da kB y se convierten).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemStat {
     /// Memoria total.
