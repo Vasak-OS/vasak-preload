@@ -4,7 +4,7 @@
 
 use crate::prefetch::{PrefetchPlan, PrefetchReport};
 use async_trait::async_trait;
-use nix::fcntl::{open, OFlag};
+use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
@@ -16,7 +16,11 @@ pub struct NoopPrefetcher;
 
 #[async_trait]
 impl super::Prefetcher for NoopPrefetcher {
-    async fn execute(&self, plan: &PrefetchPlan, _stores: &crate::stores::Stores) -> PrefetchReport {
+    async fn execute(
+        &self,
+        plan: &PrefetchPlan,
+        _stores: &crate::stores::Stores,
+    ) -> PrefetchReport {
         PrefetchReport {
             attempted: plan.maps.len() as u32,
             succeeded: plan.maps.len() as u32,
@@ -64,7 +68,9 @@ impl super::Prefetcher for PosixFadvisePrefetcher {
                 }
             } else {
                 report.failed += 1;
-                report.errors.push(format!("mapa no encontrado: {:?}", prefetch_map.map_id));
+                report
+                    .errors
+                    .push(format!("mapa no encontrado: {:?}", prefetch_map.map_id));
             }
         }
 
