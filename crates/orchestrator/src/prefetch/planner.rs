@@ -92,8 +92,9 @@ impl super::PrefetchPlanner for GreedyPrefetchPlanner {
         let mut total_bytes = 0u64;
 
         for candidate in candidates {
+            // Un mapa que no entra se salta: los que siguen pueden ser más chicos.
             if total_bytes + candidate.size > budget_bytes {
-                break;
+                continue;
             }
             total_bytes += candidate.size;
             selected.push(candidate);
@@ -248,5 +249,32 @@ mod tests {
         let plan = GreedyPrefetchPlanner::new().plan(&prediction, &stores, &mem(1 << 30, 1 << 29));
 
         assert!(plan.maps.is_empty());
+    }
+
+    #[test]
+    fn un_mapa_grande_que_no_entra_no_deja_afuera_a_los_chicos_que_siguen() {
+        let mut stores = Stores::default();
+        let mut prediction = Prediction::new(0);
+        let mut add = |path: &str, size: u64, prob: f32| {
+            let exe = stores.ensure_exe(ExeKey::new(path.into()));
+            let map = stores.ensure_map(MapSegment::new(format!("{path}.so").into(), 0, size, 0));
+            stores.attach_map(exe, map);
+            prediction.set_probability(exe, prob);
+            map
+        };
+        // El grande tiene prioridad mayor (0.9 - 0.29 contra 0.5 - 0.01) pero
+        // pasa del presupuesto de 2 MB; el chico sí entra.
+        let big = add("/bin/big", 3_000_000, 0.9);
+        let small = add("/bin/small", 100_000, 0.5);
+
+        let plan =
+            GreedyPrefetchPlanner::new().plan(&prediction, &stores, &mem(10_000_000, 4_000_000));
+
+        assert_eq!(plan.budget_bytes, 2_000_000);
+        assert_eq!(plan.maps.len(), 1);
+        assert_eq!(plan.maps[0].map_id, small);
+        assert_ne!(plan.maps[0].map_id, big);
+        assert_eq!(plan.total_bytes, 100_000);
+        assert!(plan.total_bytes <= plan.budget_bytes);
     }
 }
