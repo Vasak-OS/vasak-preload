@@ -4,7 +4,7 @@
 //! modo peer-to-peer: no hace falta bus del sistema ni root. El cliente usa el
 //! mismo `PreloadProxy` que `vasak-preload-cli`.
 
-use crate::service::{ConfigSource, EngineTask, PreloadService, stats_from_view};
+use crate::service::{ConfigSource, EngineTask, PreloadService, planner_from, stats_from_view};
 use crate::{Args, OBJECT_PATH, config_source, run, serve, wait_for_shutdown};
 use clap::Parser;
 use std::path::Path;
@@ -15,8 +15,8 @@ use tokio::time::timeout;
 use vasak_preload_config::Config;
 use vasak_preload_orchestrator::{
     CandidateExe, EngineView, Error as EngineError, ExeKey, MapSegment, MemStat, ModelDelta,
-    Observation, ObservationEvent, PredictionSummary, PrefetchReport, ProcfsScanner, Scanner,
-    SqliteRepository, StateRepository, TickReport,
+    Observation, ObservationEvent, Prediction, PredictionSummary, PrefetchPlanner, PrefetchReport,
+    ProcfsScanner, Scanner, SqliteRepository, StateRepository, Stores, TickReport,
 };
 use vasak_preload_protocol::{DaemonState, PreloadProxy};
 use zbus::proxy::CacheProperties;
@@ -699,6 +699,7 @@ impl Scanner for FixedScanner {
                     total: 1000,
                     free: 300,
                     cached: 200,
+                    available: 500,
                     pagein: 0,
                     pageout: 0,
                 },
@@ -849,6 +850,7 @@ fn full_tick() -> TickReport {
             total: 1000,
             free: 300,
             cached: 200,
+            available: 500,
             pagein: 0,
             pageout: 0,
         }),
@@ -913,4 +915,28 @@ fn un_tick_sin_datos_de_memoria_deja_el_porcentaje_en_255() {
 
     assert_eq!(stats.last_tick_scan_id, 7);
     assert_eq!(stats.last_tick_mem_free_pct, 255);
+}
+
+#[test]
+fn el_planificador_del_servicio_respeta_la_reserva_de_la_configuracion() {
+    let memstat = MemStat {
+        total: 1000,
+        free: 600,
+        cached: 0,
+        available: 600,
+        pagein: 0,
+        pageout: 0,
+    };
+    let budget = |min_free_pct: u8| {
+        let mut config = Config::default();
+        config.sistema.mem_libre_min_pct = min_free_pct;
+        planner_from(&config)
+            .plan(&Prediction::new(0), &Stores::default(), &memstat)
+            .budget_bytes
+    };
+
+    // Reserva de 20 % de 1000 = 200: (600 - 200) / 2. Sin reserva sería 300.
+    assert_eq!(budget(20), 200);
+    assert_eq!(budget(0), 300);
+    assert_eq!(budget(60), 0);
 }

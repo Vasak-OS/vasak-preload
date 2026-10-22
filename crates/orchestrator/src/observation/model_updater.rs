@@ -214,6 +214,7 @@ mod tests {
                     total: 1000,
                     free: 500,
                     cached: 200,
+                    available: 700,
                     pagein: 0,
                     pageout: 0,
                 },

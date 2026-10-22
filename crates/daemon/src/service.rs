@@ -17,6 +17,11 @@ use vasak_preload_protocol::{ConfigSnapshot, DaemonState, DaemonStats, ExeState,
 use zbus::fdo::Error as FdoError;
 use zbus::interface;
 
+/// El planificador de prefetch con la reserva de memoria de la configuración.
+pub(crate) fn planner_from(config: &Config) -> GreedyPrefetchPlanner {
+    GreedyPrefetchPlanner::new().with_min_free_pct(config.sistema.mem_libre_min_pct)
+}
+
 /// Tarea del motor en background. Quien la tiene es quien la apaga.
 pub struct EngineTask {
     cancel: CancellationToken,
@@ -117,7 +122,7 @@ impl PreloadService {
             )),
             updater: Box::new(DefaultModelUpdater::new()),
             predictor: Box::new(MarkovPredictor::new()),
-            planner: Box::new(GreedyPrefetchPlanner::new()),
+            planner: Box::new(planner_from(&config)),
             prefetcher: Box::new(NoopPrefetcher), // Usar NoopPrefetcher por seguridad inicial
             repo: Box::new(repo),
             clock: Box::new(SystemClock),
@@ -266,7 +271,7 @@ impl PreloadService {
             )),
             updater: Box::new(DefaultModelUpdater::new()),
             predictor: Box::new(MarkovPredictor::new()),
-            planner: Box::new(GreedyPrefetchPlanner::new()),
+            planner: Box::new(planner_from(&new_config)),
             prefetcher: Box::new(NoopPrefetcher),
         };
         self.send(ControlEvent::Reload(Box::new(bundle))).await?;
