@@ -131,7 +131,15 @@ impl ModelUpdater for DefaultModelUpdater {
 
         // Actualizar modelo de Markov. El conjunto activo todavía es el del
         // tick anterior: de ahí sale el estado de partida de cada arista.
-        let was_running = stores.active.exes();
+        // Salvo tras cargar: el activo reconstruido son los vistos en la
+        // ventana, no los que corrían, así que se parte de vacío para no
+        // inventar transiciones en el primer tick.
+        let was_running = if stores.active_reconstructed {
+            std::collections::HashSet::new()
+        } else {
+            stores.active.exes()
+        };
+        stores.active_reconstructed = false;
         let dt = current_time.saturating_sub(stores.active.last_update()) as f32;
         let state_of = |running: &dyn Fn(ExeId) -> bool, key: EdgeKey| {
             MarkovState::Neither.transition(running(key.a()), running(key.b()))
@@ -140,9 +148,21 @@ impl ModelUpdater for DefaultModelUpdater {
         let now = |id: ExeId| running_exes.contains_key(&id);
 
         // Pares nuevos entre lo que corría y lo que corre: sin ellos nunca se
-        // aprende que B arranca mientras A corre.
-        let mut involved: Vec<ExeId> = was_running.iter().copied().collect();
-        involved.extend(running_exes.keys().filter(|id| !was_running.contains(id)));
+        // aprende que B arranca mientras A corre. Sólo entre ejecutables con
+        // mapas (aplicaciones reales): si no, el grafo crece O(n²) con cada
+        // proceso del sistema y no se poda hasta la próxima carga.
+        let has_maps = |id: ExeId| !stores.exe_maps.maps_for_exe(id).is_empty();
+        let mut involved: Vec<ExeId> = was_running
+            .iter()
+            .copied()
+            .filter(|id| has_maps(*id))
+            .collect();
+        involved.extend(
+            running_exes
+                .keys()
+                .copied()
+                .filter(|id| !was_running.contains(id) && has_maps(*id)),
+        );
         for (i, &x) in involved.iter().enumerate() {
             for &y in &involved[i + 1..] {
                 let key = EdgeKey::new(x, y);
@@ -301,8 +321,9 @@ mod tests {
 
         let only_early = only(key, early);
         let only_late = only(key, late);
-        // Una sola observación: 0 * 0.9 + 0.1. Dos darían 0.19.
-        assert!((edge.transition_probability(only_early, MarkovState::Both) - 0.1).abs() < 1e-6);
+        // La probabilidad es la frecuencia: una sola observación de «sólo early»
+        // → «ambos» ya marca esa transición con 1, no con 0.1.
+        assert!((edge.transition_probability(only_early, MarkovState::Both) - 1.0).abs() < 1e-6);
         assert_eq!(
             edge.transition_probability(only_late, MarkovState::Both),
             0.0
@@ -409,6 +430,80 @@ mod tests {
         assert_eq!(delta.exes_added, 0);
         assert!(stores.exes.is_empty());
         assert!(stores.active.is_empty());
+    }
+
+    #[test]
+    fn no_se_tienden_aristas_entre_ejecutables_sin_mapas() {
+        let mut stores = Stores::default();
+        let policy = FixedDecision(AdmissionDecision::Accept {
+            completeness: Completeness::ExeOnly,
+        });
+        // Dos ejecutables admitidos pero sin mapas, corriendo juntos: no son
+        // aplicaciones reales y no deben tender una arista (el grafo crecería
+        // O(n²) con cada proceso del sistema).
+        let obs = vec![
+            ObservationEvent::ObsBegin {
+                time: 0,
+                scan_id: 1,
+            },
+            ObservationEvent::CandidateExe {
+                exe: CandidateExe::new("/a".into(), 1),
+            },
+            ObservationEvent::CandidateExe {
+                exe: CandidateExe::new("/b".into(), 2),
+            },
+            ObservationEvent::ObsEnd {
+                time: 0,
+                scan_id: 1,
+                warnings: vec![],
+            },
+        ];
+
+        let delta = DefaultModelUpdater::new()
+            .apply(&mut stores, &obs, &policy)
+            .unwrap();
+
+        assert_eq!(delta.exes_added, 2);
+        assert_eq!(delta.edges_added, 0);
+        assert_eq!(stores.markov.len(), 0);
+    }
+
+    #[test]
+    fn tras_cargar_el_primer_tick_no_inventa_transiciones_desde_el_activo_reconstruido() {
+        let mut stores = Stores::default();
+        let x = stores.ensure_exe(ExeKey::new("/x".into()));
+        let y = stores.ensure_exe(ExeKey::new("/y".into()));
+        stores.ensure_markov_edge(x, y, 0, MarkovState::Neither);
+        // Estado tras `load`: activo reconstruido con x,y (vistos en la ventana,
+        // no observados corriendo).
+        stores.active.update(&[x, y], 100);
+        stores.active_reconstructed = true;
+        stores.model_time = 100;
+
+        // Primer tick: no corre nada.
+        let empty = vec![
+            ObservationEvent::ObsBegin {
+                time: 120,
+                scan_id: 1,
+            },
+            ObservationEvent::ObsEnd {
+                time: 120,
+                scan_id: 1,
+                warnings: vec![],
+            },
+        ];
+        DefaultModelUpdater::new()
+            .apply(&mut stores, &empty, &open_policy())
+            .unwrap();
+
+        let edge = stores.markov.get(EdgeKey::new(x, y)).unwrap();
+        // Sin el arreglo se tomaba a x,y como «ambos corrían» y se observaba
+        // Both -> Neither, una transición que nunca pasó.
+        assert_eq!(
+            edge.transition_probability(MarkovState::Both, MarkovState::Neither),
+            0.0
+        );
+        assert!(!stores.active_reconstructed, "la bandera se consume");
     }
 
     #[test]

@@ -69,4 +69,8 @@ pub struct MarkovRecord {
     pub time_to_leave: [f32; 4],
     pub transition_prob: [[f32; 4]; 4],
     pub both_running_time: u64,
+    /// Observaciones por estado de partida. `default` para leer snapshots
+    /// viejos sin el campo (se toman como sin observar).
+    #[serde(default)]
+    pub observations: [u32; 4],
 }
