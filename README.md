@@ -327,6 +327,20 @@ Tipos habituales: `feat`, `fix`, `bugfix`, `docs`, `ci`, `chore`, `security`, `r
 
 Y para apps Tauri+Vue: features del `tauri.conf.json` → `bundle` / `plugins` / `allowlist` (capabilities).
 
+### Límite deliberado: sin visibilidad cross-user
+
+El daemon sólo precarga para los procesos que puede ver **sin privilegio**. Leer
+qué archivos mapean los procesos de **otros usuarios** (`/proc/<pid>/maps`, y
+también `/proc/<pid>/exe`) está gateado por el kernel con `ptrace_may_access`, y
+la única capacidad que lo abre es `CAP_SYS_PTRACE` — que **no se otorga a
+propósito**: en un servicio always-on dejaría leer la memoria de cualquier
+proceso (ssh-agent, gpg-agent, el llavero), justo lo que protege el
+[THREAT-MODEL](https://github.com/Vasak-OS/.github/blob/main/THREAT-MODEL.md), a
+cambio de una mejora de rendimiento. Es una decisión de diseño, no una falla
+([#3](https://github.com/Vasak-OS/vasak-preload/issues/3)). El camino a cobertura
+amplia sin ptrace es un observador por-usuario
+([#28](https://github.com/Vasak-OS/vasak-preload/issues/28)).
+
 ---
 
 ## Pruebas y calidad

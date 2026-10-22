@@ -30,7 +30,18 @@ MemoryDenyWriteExecute=yes
 # El escáner lee /proc/meminfo para medir la presión de memoria, que queda
 # fuera de la vista con ProcSubset=pid; por eso se deja el /proc completo.
 ProcSubset=all
-# Capabilities mínimas
+# Capabilities mínimas.
+#
+# A propósito **sin CAP_SYS_PTRACE**, aunque leer `/proc/<pid>/maps` (y hasta
+# `/proc/<pid>/exe`) de procesos de **otros usuarios** la exige: el kernel la
+# gatea con `ptrace_may_access`, y `CAP_DAC_READ_SEARCH` no la abre. Otorgarla
+# dejaría a este servicio always-on adjuntarse a cualquier proceso —ssh-agent,
+# gpg-agent, el llavero— y leerle la memoria, justo lo que el THREAT-MODEL
+# protege; es una capacidad casi equivalente a root para una mejora de
+# rendimiento (calentar el page cache). Por eso el daemon degrada: sólo precarga
+# para los procesos que ve sin privilegio. La cobertura cross-user queda fuera de
+# alcance (vasak-preload#3); el camino sin ptrace es un observador por-usuario
+# (vasak-preload#28).
 AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE
 
