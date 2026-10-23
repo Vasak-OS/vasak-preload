@@ -43,8 +43,9 @@ mem_libre_min_pct = 10
 tamano_pagina = 4096
 
 [persistencia]
-# Ruta al archivo de estado (SQLite)
-estado_path = "/var/lib/vasak-preload/state.sqlite"
+# Ruta al archivo de estado (SQLite). Por omisión, el de cada persona:
+# $XDG_STATE_HOME/vasak-preload/state.sqlite (~/.local/state/...), con modo 0600.
+# estado_path = "~/.local/state/vasak-preload/state.sqlite"
 
 # Intervalo de autoguardado (en segundos). None = usar valor de sistema.
 # autosave_interval = 300

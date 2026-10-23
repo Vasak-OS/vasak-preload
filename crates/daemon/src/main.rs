@@ -1,6 +1,7 @@
 //! Daemon principal de vasak-preload.
 //!
-//! Expone una interfaz D-Bus para control y monitoreo.
+//! Corre como servicio de usuario (`systemd --user`) y expone una interfaz D-Bus
+//! en el bus de la sesión para control y monitoreo.
 
 #![forbid(unsafe_code)]
 
@@ -26,7 +27,7 @@ use vasak_preload_orchestrator::{ProcfsScanner, Scanner};
 #[command(
     name = "vasak-preload",
     version,
-    about = "VasakOS system optimizer: prefetches binaries based on usage patterns"
+    about = "VasakOS user service: prefetches binaries based on usage patterns"
 )]
 struct Args {
     /// Archivo de configuración.
@@ -76,10 +77,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Iniciando vasak-preload");
 
-    // Publicar el servicio en el bus del sistema. Si el nombre no se puede
-    // tomar, el motor no llega a arrancar.
+    // Publicar el servicio en el bus de la sesión: sólo entra quien corre como
+    // la misma persona, así que no hay política que escribir. Si el nombre no
+    // se puede tomar, el motor no llega a arrancar.
     run(
-        connection::Builder::system()?.name(BUS_NAME)?,
+        connection::Builder::session()?.name(BUS_NAME)?,
         config,
         source,
         wait_for_shutdown(),

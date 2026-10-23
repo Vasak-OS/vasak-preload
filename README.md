@@ -327,19 +327,39 @@ Tipos habituales: `feat`, `fix`, `bugfix`, `docs`, `ci`, `chore`, `security`, `r
 
 Y para apps Tauri+Vue: features del `tauri.conf.json` → `bundle` / `plugins` / `allowlist` (capabilities).
 
-### Límite deliberado: sin visibilidad cross-user
+### Un servicio por persona, sin privilegios
 
-El daemon sólo precarga para los procesos que puede ver **sin privilegio**. Leer
-qué archivos mapean los procesos de **otros usuarios** (`/proc/<pid>/maps`, y
-también `/proc/<pid>/exe`) está gateado por el kernel con `ptrace_may_access`, y
-la única capacidad que lo abre es `CAP_SYS_PTRACE` — que **no se otorga a
-propósito**: en un servicio always-on dejaría leer la memoria de cualquier
-proceso (ssh-agent, gpg-agent, el llavero), justo lo que protege el
+`vasak-preload` corre como **servicio de usuario** (`systemd --user`), sin
+capacidades, y arranca con la sesión gráfica (`graphical-session.target`). Cada
+persona tiene el suyo: escanea sólo **sus** procesos, guarda **su** modelo de
+Markov en `$XDG_STATE_HOME/vasak-preload/state.sqlite` (directorio 0700, archivo
+0600: es su historial de uso, en claro) y precarga con sus propias credenciales.
+Habla por el **bus de la sesión**, donde sólo entra la misma persona, así que no
+hay política de D-Bus que escribir. El page cache es compartido: lo que precarga
+una persona le sirve a las demás, sin que ningún dato pase de un uid a otro.
+
+Antes de iniciar sesión no se precarga nada.
+
+Esto es deliberado, no una falla
+([#3](https://github.com/Vasak-OS/vasak-preload/issues/3),
+[#28](https://github.com/Vasak-OS/vasak-preload/issues/28)). Leer qué archivos
+mapean los procesos de **otros usuarios** (`/proc/<pid>/maps`, y también
+`/proc/<pid>/exe`) está gateado por el kernel con `ptrace_may_access`, y la
+única capacidad que lo abre es `CAP_SYS_PTRACE`, que **no se otorga**: en un
+servicio siempre activo dejaría leer la memoria de cualquier proceso (ssh-agent,
+gpg-agent, el llavero), justo lo que protege el
 [THREAT-MODEL](https://github.com/Vasak-OS/.github/blob/main/THREAT-MODEL.md), a
-cambio de una mejora de rendimiento. Es una decisión de diseño, no una falla
-([#3](https://github.com/Vasak-OS/vasak-preload/issues/3)). El camino a cobertura
-amplia sin ptrace es un observador por-usuario
-([#28](https://github.com/Vasak-OS/vasak-preload/issues/28)).
+cambio de una mejora de rendimiento. Con un servicio por persona no hace falta.
+
+- Los procesos en **otro espacio de montajes** (Steam, Flatpak) se ignoran: sus
+  rutas no se pueden resolver desde afuera.
+- La configuración se lee de `/etc/vasak-preload/config.toml` y
+  `~/.config/vasak-preload/config.toml`; sin ninguno, valores por omisión.
+
+```bash
+systemctl --user enable --now vasak-preload.service   # a mano, para probar
+vasak-preload-cli status                              # habla con el de tu sesión
+```
 
 ---
 

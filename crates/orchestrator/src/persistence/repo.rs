@@ -10,6 +10,7 @@ use crate::persistence::snapshot::{
 use async_trait::async_trait;
 use serde_json;
 use sqlx::Row;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -69,10 +70,24 @@ impl SqliteRepository {
     pub async fn new(state_path: impl AsRef<Path>) -> Result<Self, Error> {
         let state_path = state_path.as_ref().to_path_buf();
 
-        // Crear directorio padre si no existe
+        // Crear directorio padre si no existe. Lo que se crea acá lleva modo 0700:
+        // el modelo es el historial de uso de una persona y se guarda en claro.
+        // Un directorio que ya existía no se toca: lo eligió quien configuró la ruta.
         if let Some(parent) = state_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
         }
+        // La base se crea antes de que SQLite la abra, con modo 0600. SQLite crea
+        // el WAL y el SHM con el modo de la base, así que quedan igual. Si ya
+        // existía más abierta (una copia, una instalación anterior) se cierra.
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&state_path)?;
+        std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o600))?;
 
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -169,5 +184,66 @@ impl StateRepository for SqliteRepository {
         .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
+
+    fn modo(ruta: &Path) -> u32 {
+        std::fs::metadata(ruta).unwrap().permissions().mode() & 0o777
+    }
+
+    /// El modelo guarda qué ejecutables y bibliotecas usa una persona y en qué
+    /// orden: es su historial de uso, y se guarda en claro. Por eso sólo lo lee
+    /// su dueña, igual que el de `vasak-health-service`.
+    #[tokio::test]
+    async fn el_modelo_y_su_directorio_son_solo_de_su_dueno() {
+        let dir = tempdir().unwrap();
+        let estado = dir.path().join("state/vasak-preload/state.sqlite");
+
+        let repo = SqliteRepository::new(&estado).await.unwrap();
+        repo.save(&repo.load().await.unwrap()).await.unwrap();
+
+        assert_eq!(modo(&estado), 0o600, "la base");
+        assert_eq!(modo(estado.parent().unwrap()), 0o700, "su directorio");
+        // WAL y SHM los crea SQLite con el modo de la base: sin esto el
+        // historial se lee desde ellos aunque la base esté cerrada.
+        for extra in ["state.sqlite-wal", "state.sqlite-shm"] {
+            let ruta = estado.with_file_name(extra);
+            if ruta.exists() {
+                assert_eq!(modo(&ruta), 0o600, "{extra}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn una_base_que_ya_estaba_abierta_a_todos_se_cierra() {
+        // Una instalación anterior, o una copia, puede dejarla en 0644.
+        let dir = tempdir().unwrap();
+        let estado = dir.path().join("state.sqlite");
+        std::fs::write(&estado, b"").unwrap();
+        std::fs::set_permissions(&estado, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        SqliteRepository::new(&estado).await.unwrap();
+
+        assert_eq!(modo(&estado), 0o600);
+    }
+
+    #[tokio::test]
+    async fn no_se_toca_el_modo_de_un_directorio_que_ya_existia() {
+        // El directorio es lo que eligió quien configuró la ruta: sólo se le
+        // pone modo a lo que se crea acá.
+        let dir = tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        SqliteRepository::new(dir.path().join("state.sqlite"))
+            .await
+            .unwrap();
+
+        assert_eq!(modo(dir.path()), 0o755);
     }
 }
