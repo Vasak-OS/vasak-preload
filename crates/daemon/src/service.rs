@@ -76,12 +76,12 @@ impl ConfigSource {
                 paths.sort();
                 Ok(Config::cargar_multiple(paths)?)
             }
-            ConfigSource::Default => Ok(Config::cargar_multiple([
-                PathBuf::from("/etc/vasak-preload/config.toml"),
+            ConfigSource::Default => Ok(Config::cargar_de_sistema_y_usuario(
+                "/etc/vasak-preload/config.toml",
                 dirs::config_dir()
                     .map(|d| d.join("vasak-preload/config.toml"))
                     .unwrap_or_default(),
-            ])?),
+            )?),
         }
     }
 }

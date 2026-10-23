@@ -27,11 +27,23 @@ RestartSec=5
 # Nada de ProtectHome ni ProtectSystem: el modelo vive en ~/.local/state y lo que
 # se precarga puede estar en /home. Y el /proc completo, porque el escáner lee
 # /proc/meminfo para medir la presión de memoria, que ProcSubset=pid taparía.
+#
+# Lo que queda es lo que no depende de user namespaces (seccomp, con
+# NoNewPrivileges): probado contra un user manager real, con el filtro incluido
+# (fadvise64 y readahead, que usa el prefetcher, están en @system-service).
 NoNewPrivileges=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# El modelo es el historial de uso de la persona: lo que cree el servicio nace
+# sin acceso para el resto.
+UMask=0077
 
 [Install]
 WantedBy=graphical-session.target

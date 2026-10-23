@@ -63,6 +63,39 @@ impl Config {
             let doc: toml_edit::DocumentMut = texto.parse()?;
             combinar_documento(&mut combinado, doc);
         }
+        Self::desde_documento(&combinado)
+    }
+
+    /// La configuración de un servicio de usuario: la del sistema y, encima, la de
+    /// la persona.
+    ///
+    /// El `estado_path` del archivo del sistema se ignora. Ese archivo es de todas
+    /// las personas y el servicio es de una: la misma ruta las haría escribir en
+    /// el mismo lugar (y mezclar su historial de uso), y una instalación anterior
+    /// la dejó apuntando a `/var/lib/vasak-preload`, donde ninguna puede escribir.
+    pub fn cargar_de_sistema_y_usuario(
+        sistema: impl AsRef<Path>,
+        usuario: impl AsRef<Path>,
+    ) -> Result<Self, Error> {
+        let mut combinado = toml_edit::DocumentMut::new();
+        for (path, es_del_sistema) in [(sistema.as_ref(), true), (usuario.as_ref(), false)] {
+            if !path.exists() {
+                continue;
+            }
+            let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(path)?.parse()?;
+            if es_del_sistema {
+                if let Some(persistencia) =
+                    doc.get_mut("persistencia").and_then(|i| i.as_table_mut())
+                {
+                    persistencia.remove("estado_path");
+                }
+            }
+            combinar_documento(&mut combinado, doc);
+        }
+        Self::desde_documento(&combinado)
+    }
+
+    fn desde_documento(combinado: &toml_edit::DocumentMut) -> Result<Self, Error> {
         let mut config: Config = toml_edit::de::from_str(&combinado.to_string())?;
         config.aplicar_defectos();
         Ok(config)
@@ -117,6 +150,72 @@ mod tests {
         let cargado = Config::cargar(&path).unwrap();
 
         assert_eq!(config, cargado);
+    }
+
+    /// Un `/etc` de una instalación anterior traía `estado_path` apuntando a
+    /// `/var/lib/vasak-preload` (el ejemplo lo traía descomentado y la unidad
+    /// exigía ese archivo). Ese archivo es de todas las personas: con un servicio
+    /// por persona, esa ruta rompería el arranque de cada una (no puede escribir
+    /// ahí), y una ruta compartida mezclaría el historial de todas.
+    #[test]
+    fn el_estado_path_de_etc_se_ignora() {
+        let dir = tempdir().unwrap();
+        let sistema = dir.path().join("etc.toml");
+        let usuario = dir.path().join("usuario.toml");
+        std::fs::write(
+            &sistema,
+            "[persistencia]\nestado_path = \"/var/lib/vasak-preload/state.sqlite\"\nsave_on_shutdown = false\n[modelo]\nciclo = 60\n",
+        )
+        .unwrap();
+
+        let cfg = Config::cargar_de_sistema_y_usuario(&sistema, &usuario).unwrap();
+
+        assert_eq!(
+            cfg.persistencia.estado_path,
+            Persistencia::default().estado_path
+        );
+        // El resto de lo que dice /etc sí rige: es la política del sistema.
+        assert!(!cfg.persistencia.save_on_shutdown);
+        assert_eq!(cfg.modelo.ciclo, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn el_estado_path_del_usuario_si_se_respeta() {
+        let dir = tempdir().unwrap();
+        let sistema = dir.path().join("etc.toml");
+        let usuario = dir.path().join("usuario.toml");
+        std::fs::write(
+            &sistema,
+            "[persistencia]\nestado_path = \"/var/lib/vasak-preload/state.sqlite\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &usuario,
+            "[persistencia]\nestado_path = \"/home/ana/modelo.sqlite\"\n",
+        )
+        .unwrap();
+
+        let cfg = Config::cargar_de_sistema_y_usuario(&sistema, &usuario).unwrap();
+
+        assert_eq!(
+            cfg.persistencia.estado_path,
+            std::path::PathBuf::from("/home/ana/modelo.sqlite")
+        );
+    }
+
+    #[test]
+    fn sin_ningun_archivo_son_los_valores_por_omision() {
+        let dir = tempdir().unwrap();
+        let cfg = Config::cargar_de_sistema_y_usuario(
+            dir.path().join("no-hay-uno"),
+            dir.path().join("no-hay-otro"),
+        )
+        .unwrap();
+        assert_eq!(cfg, {
+            let mut c = Config::default();
+            c.aplicar_defectos();
+            c
+        });
     }
 
     #[test]

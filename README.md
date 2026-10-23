@@ -333,7 +333,10 @@ Y para apps Tauri+Vue: features del `tauri.conf.json` → `bundle` / `plugins` /
 capacidades, y arranca con la sesión gráfica (`graphical-session.target`). Cada
 persona tiene el suyo: escanea sólo **sus** procesos, guarda **su** modelo de
 Markov en `$XDG_STATE_HOME/vasak-preload/state.sqlite` (directorio 0700, archivo
-0600: es su historial de uso, en claro) y precarga con sus propias credenciales.
+0600: es su historial de uso, en claro) y, cuando la precarga esté activa
+([#23](https://github.com/Vasak-OS/vasak-preload/issues/23)), precargará con sus
+propias credenciales. **Hoy aprende pero todavía no precarga**: por eso ninguna
+receta habilita la unidad hasta que lo haga.
 Habla por el **bus de la sesión**, donde sólo entra la misma persona, así que no
 hay política de D-Bus que escribir. El page cache es compartido: lo que precarga
 una persona le sirve a las demás, sin que ningún dato pase de un uid a otro.

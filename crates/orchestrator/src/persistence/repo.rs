@@ -10,7 +10,7 @@ use crate::persistence::snapshot::{
 use async_trait::async_trait;
 use serde_json;
 use sqlx::Row;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -82,12 +82,25 @@ impl SqliteRepository {
         // La base se crea antes de que SQLite la abra, con modo 0600. SQLite crea
         // el WAL y el SHM con el modo de la base, así que quedan igual. Si ya
         // existía más abierta (una copia, una instalación anterior) se cierra.
-        std::fs::OpenOptions::new()
+        //
+        // Por descriptor y sin seguir enlaces: quien pueda escribir en el directorio
+        // del estado dejaría un enlace a otro archivo de la persona, y un chmod por
+        // ruta se lo cerraría. Y la base tiene que ser de quien corre el servicio.
+        let archivo = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&state_path)?;
-        std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o600))?;
+        let duenio = archivo.metadata()?.uid();
+        let yo = std::fs::metadata("/proc/self")?.uid();
+        if duenio != yo {
+            return Err(Error::Other(format!(
+                "{} es del uid {duenio} y este servicio corre como {yo}",
+                state_path.display()
+            )));
+        }
+        archivo.set_permissions(std::fs::Permissions::from_mode(0o600))?;
 
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -214,9 +227,9 @@ mod tests {
         // historial se lee desde ellos aunque la base esté cerrada.
         for extra in ["state.sqlite-wal", "state.sqlite-shm"] {
             let ruta = estado.with_file_name(extra);
-            if ruta.exists() {
-                assert_eq!(modo(&ruta), 0o600, "{extra}");
-            }
+            // Que existan: si SQLite no los dejara, esto comprobaría nada.
+            assert!(ruta.exists(), "{extra} no existe");
+            assert_eq!(modo(&ruta), 0o600, "{extra}");
         }
     }
 
@@ -231,6 +244,44 @@ mod tests {
         SqliteRepository::new(&estado).await.unwrap();
 
         assert_eq!(modo(&estado), 0o600);
+    }
+
+    #[tokio::test]
+    async fn no_sigue_un_enlace_simbolico_en_la_ruta_del_estado() {
+        // Quien pueda escribir en el directorio del estado dejaría un enlace a
+        // otro archivo de la persona, y el chmod y SQLite lo seguirían.
+        let dir = tempdir().unwrap();
+        let ajeno = dir.path().join("ajeno");
+        std::fs::write(&ajeno, b"no tocar").unwrap();
+        std::fs::set_permissions(&ajeno, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let estado = dir.path().join("state.sqlite");
+        std::os::unix::fs::symlink(&ajeno, &estado).unwrap();
+
+        assert!(SqliteRepository::new(&estado).await.is_err());
+
+        assert_eq!(modo(&ajeno), 0o644, "el destino del enlace no se toca");
+        assert_eq!(std::fs::read(&ajeno).unwrap(), b"no tocar");
+    }
+
+    #[tokio::test]
+    async fn un_wal_y_un_shm_que_ya_estaban_abiertos_se_cierran() {
+        // SQLite sólo copia el modo de la base cuando crea esos archivos: uno que
+        // ya existía (una copia del directorio, una versión anterior) se queda
+        // como estaba y lee el historial aunque la base esté cerrada.
+        let dir = tempdir().unwrap();
+        let estado = dir.path().join("state.sqlite");
+        for extra in ["state.sqlite-wal", "state.sqlite-shm"] {
+            let ruta = dir.path().join(extra);
+            std::fs::write(&ruta, b"").unwrap();
+            std::fs::set_permissions(&ruta, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+
+        let repo = SqliteRepository::new(&estado).await.unwrap();
+        repo.save(&repo.load().await.unwrap()).await.unwrap();
+
+        for extra in ["state.sqlite-wal", "state.sqlite-shm"] {
+            assert_eq!(modo(&dir.path().join(extra)), 0o600, "{extra}");
+        }
     }
 
     #[tokio::test]

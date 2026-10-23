@@ -48,6 +48,18 @@ fn el_unit_es_de_usuario_y_no_pide_privilegios() {
     }
     assert!(has("NoNewPrivileges=yes"));
     assert!(has("MemoryDenyWriteExecute=yes"));
+    // Lo que sí funciona sin user namespaces: seccomp y la máscara de creación.
+    // El modelo es el historial de uso de la persona; con `UMask=0077` nada de lo
+    // que cree el servicio nace abierto al resto.
+    for endurecimiento in [
+        "UMask=0077",
+        "RestrictRealtime=yes",
+        "RestrictSUIDSGID=yes",
+        "SystemCallArchitectures=native",
+        "SystemCallFilter=@system-service",
+    ] {
+        assert!(has(endurecimiento), "falta {endurecimiento}");
+    }
 }
 
 #[test]
