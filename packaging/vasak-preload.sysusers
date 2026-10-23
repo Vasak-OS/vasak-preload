@@ -1,4 +1,0 @@
-# Crea el usuario y el grupo del sistema `vasak-preload` que usa el unit
-# (User=/Group=vasak-preload). El tipo `u` crea los dos con el mismo nombre.
-#Type Name          ID GECOS                    Home Shell
-u     vasak-preload -  "VasakOS Preload Daemon" -    -

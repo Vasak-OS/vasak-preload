@@ -1,49 +1,49 @@
 [Unit]
-Description=VasakOS Preload Daemon
+Description=VasakOS Preload (servicio de usuario)
 Documentation=https://github.com/Vasak-OS/vasak-preload
-ConditionPathExists=/etc/vasak-preload/config.toml
+# Arranca y se apaga con la sesión gráfica: antes de iniciar sesión no se
+# precarga nada (vasak-preload#28).
+PartOf=graphical-session.target
+After=graphical-session.target
 
 [Service]
+# `dbus` espera a que el servicio tome su nombre en el bus de la sesión.
 Type=dbus
 BusName=org.vasakos.Preload
-ExecStart=/usr/bin/vasak-preload --config /etc/vasak-preload/config.toml
+# Sin --config: lee /etc/vasak-preload/config.toml y ~/.config/vasak-preload/config.toml,
+# y arranca con los valores por omisión si no existe ninguno.
+ExecStart=/usr/bin/vasak-preload
 Restart=on-failure
 RestartSec=5
-User=vasak-preload
-Group=vasak-preload
-# Crea y da permiso de escritura a /var/lib/vasak-preload (donde vive
-# state.sqlite): sin esto, con ProtectSystem=strict el estado queda de sólo
-# lectura y el guardado falla.
-StateDirectory=vasak-preload
-# Seguridad
+# Seguridad.
+#
+# Corre como la persona de la sesión, sin capacidades: ve sus propios procesos y
+# no necesita más. Es a propósito **sin CAP_SYS_PTRACE** (vasak-preload#3): leer
+# los mapas de procesos ajenos exige ptrace, que dejaría a un servicio siempre
+# activo leer la memoria de cualquier proceso, justo lo que protege el
+# THREAT-MODEL. Cada persona corre el suyo, y el page cache es compartido: lo que
+# precarga una le sirve a las demás sin que ningún dato pase de un uid a otro.
+#
+# Nada de ProtectHome ni ProtectSystem: el modelo vive en ~/.local/state y lo que
+# se precarga puede estar en /home. Y el /proc completo, porque el escáner lee
+# /proc/meminfo para medir la presión de memoria, que ProcSubset=pid taparía.
+#
+# Lo que queda es lo que no depende de user namespaces (seccomp, con
+# NoNewPrivileges): probado contra un user manager real, con el filtro incluido
+# (fadvise64 y readahead, que usa el prefetcher, están en @system-service).
 NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictAddressFamilies=AF_UNIX
-RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-# El escáner lee /proc/meminfo para medir la presión de memoria, que queda
-# fuera de la vista con ProcSubset=pid; por eso se deja el /proc completo.
-ProcSubset=all
-# Capabilities mínimas.
-#
-# A propósito **sin CAP_SYS_PTRACE**, aunque leer `/proc/<pid>/maps` (y hasta
-# `/proc/<pid>/exe`) de procesos de **otros usuarios** la exige: el kernel la
-# gatea con `ptrace_may_access`, y `CAP_DAC_READ_SEARCH` no la abre. Otorgarla
-# dejaría a este servicio always-on adjuntarse a cualquier proceso —ssh-agent,
-# gpg-agent, el llavero— y leerle la memoria, justo lo que el THREAT-MODEL
-# protege; es una capacidad casi equivalente a root para una mejora de
-# rendimiento (calentar el page cache). Por eso el daemon degrada: sólo precarga
-# para los procesos que ve sin privilegio. La cobertura cross-user queda fuera de
-# alcance (vasak-preload#3); el camino sin ptrace es un observador por-usuario
-# (vasak-preload#28).
-AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE
-CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# El modelo es el historial de uso de la persona: lo que cree el servicio nace
+# sin acceso para el resto.
+UMask=0077
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical-session.target

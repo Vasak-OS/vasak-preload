@@ -67,8 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    // Conectar al bus del sistema
-    let conn = Connection::system().await?;
+    // Conectar al bus de la sesión, donde publica el servicio de usuario
+    let conn = Connection::session().await?;
 
     let proxy = PreloadProxy::new(&conn).await?;
 

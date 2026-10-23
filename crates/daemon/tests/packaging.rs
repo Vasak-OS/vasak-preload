@@ -16,30 +16,102 @@ fn read(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("leyendo {}: {e}", path.display()))
 }
 
-#[test]
-fn el_unit_deja_leer_proc_meminfo_y_escribir_el_estado() {
-    let unit = read("vasak-preload.service");
-    // Directivas efectivas, sin comentarios (una línea puede nombrar una
-    // directiva al explicarla sin configurarla).
-    let directives: Vec<&str> = unit
+/// Las directivas efectivas de la unidad, sin comentarios (una línea puede
+/// nombrar una directiva al explicarla sin configurarla).
+fn directives() -> Vec<String> {
+    read("vasak-preload.service")
         .lines()
-        .map(|l| l.trim())
+        .map(|l| l.trim().to_string())
         .filter(|l| !l.starts_with('#') && !l.is_empty())
-        .collect();
-    let has = |d: &str| directives.iter().any(|l| *l == d);
+        .collect()
+}
+
+#[test]
+fn el_unit_es_de_usuario_y_no_pide_privilegios() {
+    let directives = directives();
+    let has = |d: &str| directives.iter().any(|l| l == d);
+    let sets = |prefijo: &str| directives.iter().any(|l| l.starts_with(prefijo));
+
+    // Corre como la persona de la sesión: nada de otro usuario ni de capacidades.
+    // Con `CAP_SYS_PTRACE` fuera de la mesa (vasak-preload#3), el servicio ve
+    // sus propios procesos y no necesita ninguna.
+    for prohibida in [
+        "User=",
+        "Group=",
+        "AmbientCapabilities=",
+        "CapabilityBoundingSet=",
+    ] {
+        assert!(
+            !sets(prohibida),
+            "{prohibida} no va en un servicio de usuario"
+        );
+    }
+    assert!(has("NoNewPrivileges=yes"));
+    assert!(has("MemoryDenyWriteExecute=yes"));
+    // Lo que sí funciona sin user namespaces: seccomp y la máscara de creación.
+    // El modelo es el historial de uso de la persona; con `UMask=0077` nada de lo
+    // que cree el servicio nace abierto al resto.
+    for endurecimiento in [
+        "UMask=0077",
+        "RestrictRealtime=yes",
+        "RestrictSUIDSGID=yes",
+        "SystemCallArchitectures=native",
+        "SystemCallFilter=@system-service",
+    ] {
+        assert!(has(endurecimiento), "falta {endurecimiento}");
+    }
+}
+
+#[test]
+fn el_unit_arranca_con_la_sesion_grafica_y_toma_su_nombre_en_el_bus() {
+    let directives = directives();
+    let has = |d: &str| directives.iter().any(|l| l == d);
+
+    // Antes de iniciar sesión no se precarga nada (vasak-preload#28): la unidad
+    // cuelga de la sesión gráfica, no de multi-user.target.
+    assert!(has("WantedBy=graphical-session.target"));
+    assert!(has("PartOf=graphical-session.target"));
+    assert!(!has("WantedBy=multi-user.target"));
+    // `Type=dbus` espera a que el servicio tome el nombre en el bus de la sesión.
+    assert!(has("Type=dbus"));
+    assert!(has("BusName=org.vasakos.Preload"));
+}
+
+#[test]
+fn el_unit_deja_leer_proc_meminfo_y_el_home() {
+    let directives = directives();
+    let has = |d: &str| directives.iter().any(|l| l == d);
 
     // ProcSubset=pid tapa /proc/meminfo, que el escáner necesita.
     assert!(
         !has("ProcSubset=pid"),
         "ProcSubset=pid oculta /proc/meminfo"
     );
-    // Con ProtectSystem=strict hace falta StateDirectory para que
-    // /var/lib/vasak-preload sea escribible.
+    // El modelo vive en ~/.local/state y lo que se precarga puede estar en
+    // /home: ProtectHome lo taparía.
     assert!(
-        has("StateDirectory=vasak-preload"),
-        "sin StateDirectory el estado queda de sólo lectura"
+        !directives.iter().any(|l| l.starts_with("ProtectHome=")),
+        "ProtectHome oculta el estado y los binarios del home"
     );
-    // El daemon no usa red.
+    // No hay condición sobre un archivo de /etc: el servicio arranca sin
+    // configuración (los valores por omisión alcanzan).
+    assert!(
+        !directives
+            .iter()
+            .any(|l| l.starts_with("ConditionPathExists=")),
+        "sin /etc/vasak-preload/config.toml el servicio no arrancaba"
+    );
+    // ni toma la configuración de un solo archivo: lee /etc y ~/.config.
+    let exec = directives
+        .iter()
+        .find(|l| l.starts_with("ExecStart="))
+        .expect("falta ExecStart");
+    assert_eq!(exec, "ExecStart=/usr/bin/vasak-preload");
+}
+
+#[test]
+fn el_unit_no_usa_red_y_apunta_a_la_organizacion() {
+    let directives = directives();
     assert!(
         !directives
             .iter()
@@ -56,34 +128,15 @@ fn el_unit_deja_leer_proc_meminfo_y_escribir_el_estado() {
 }
 
 #[test]
-fn hay_politica_de_dbus_que_restringe_el_control_a_root() {
-    let policy = read("org.vasakos.Preload.conf");
-
-    // El usuario del servicio puede tomar el nombre en el bus del sistema.
-    assert!(
-        policy.contains(r#"<allow own="org.vasakos.Preload"/>"#),
-        "sin la regla own el daemon no puede tomar el nombre"
-    );
-    // Los métodos de control no se conceden en el contexto por defecto: no
-    // aparecen como send_member fuera de la política de root.
-    for control in ["Pause", "Resume", "SaveNow", "ReloadConfig"] {
+fn no_quedan_la_politica_de_dbus_ni_el_usuario_de_sistema() {
+    // En el bus de sesión sólo entra la misma persona: la política que dejaba el
+    // control a root y el usuario `vasak-preload` eran del daemon de sistema.
+    for retirado in ["org.vasakos.Preload.conf", "vasak-preload.sysusers"] {
         assert!(
-            !policy.contains(&format!(r#"send_member="{control}""#)),
-            "el método de control {control} no debe concederse a cualquiera"
+            !packaging_dir().join(retirado).exists(),
+            "{retirado} era del daemon de sistema y ya no va"
         );
     }
-}
-
-#[test]
-fn hay_sysusers_que_crea_el_usuario_del_servicio() {
-    let sysusers = read("vasak-preload.sysusers");
-    assert!(
-        sysusers.lines().any(|l| {
-            let l = l.trim_start();
-            !l.starts_with('#') && l.starts_with("u ") && l.contains("vasak-preload")
-        }),
-        "falta la línea que crea el usuario vasak-preload"
-    );
 }
 
 #[test]
