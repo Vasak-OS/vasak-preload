@@ -65,42 +65,55 @@ pub struct SqliteRepository {
     state_path: std::path::PathBuf,
 }
 
+/// Crea el directorio y el archivo del estado con los permisos del modelo.
+fn preparar_archivo(state_path: &Path) -> Result<(), Error> {
+    // Crear directorio padre si no existe. Lo que se crea acá lleva modo 0700:
+    // el modelo es el historial de uso de una persona y se guarda en claro.
+    // Un directorio que ya existía no se toca: lo eligió quien configuró la ruta.
+    if let Some(parent) = state_path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    // La base se crea antes de que SQLite la abra, con modo 0600. SQLite crea
+    // el WAL y el SHM con el modo de la base, así que quedan igual. Si ya
+    // existía más abierta (una copia, una instalación anterior) se cierra.
+    //
+    // Por descriptor y sin seguir enlaces: quien pueda escribir en el directorio
+    // del estado dejaría un enlace a otro archivo de la persona, y un chmod por
+    // ruta se lo cerraría. Y la base tiene que ser de quien corre el servicio.
+    let archivo = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(state_path)?;
+    let duenio = archivo.metadata()?.uid();
+    let yo = std::fs::metadata("/proc/self")?.uid();
+    if duenio != yo {
+        return Err(Error::Other(format!(
+            "{} es del uid {duenio} y este servicio corre como {yo}",
+            state_path.display()
+        )));
+    }
+    archivo.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+
+    Ok(())
+}
+
 impl SqliteRepository {
     /// Crea un nuevo repositorio SQLite.
     pub async fn new(state_path: impl AsRef<Path>) -> Result<Self, Error> {
         let state_path = state_path.as_ref().to_path_buf();
 
-        // Crear directorio padre si no existe. Lo que se crea acá lleva modo 0700:
-        // el modelo es el historial de uso de una persona y se guarda en claro.
-        // Un directorio que ya existía no se toca: lo eligió quien configuró la ruta.
-        if let Some(parent) = state_path.parent() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
-        }
-        // La base se crea antes de que SQLite la abra, con modo 0600. SQLite crea
-        // el WAL y el SHM con el modo de la base, así que quedan igual. Si ya
-        // existía más abierta (una copia, una instalación anterior) se cierra.
-        //
-        // Por descriptor y sin seguir enlaces: quien pueda escribir en el directorio
-        // del estado dejaría un enlace a otro archivo de la persona, y un chmod por
-        // ruta se lo cerraría. Y la base tiene que ser de quien corre el servicio.
-        let archivo = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&state_path)?;
-        let duenio = archivo.metadata()?.uid();
-        let yo = std::fs::metadata("/proc/self")?.uid();
-        if duenio != yo {
-            return Err(Error::Other(format!(
-                "{} es del uid {duenio} y este servicio corre como {yo}",
-                state_path.display()
-            )));
-        }
-        archivo.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        // En un hilo aparte: son operaciones de archivo bloqueantes.
+        let ruta = state_path.clone();
+        tokio::task::spawn_blocking(move || preparar_archivo(&ruta))
+            .await
+            .map_err(|e| {
+                Error::Other(format!("la preparación del estado se interrumpió: {e}"))
+            })??;
 
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)

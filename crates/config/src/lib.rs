@@ -110,7 +110,10 @@ impl Config {
 
 fn combinar_documento(destino: &mut toml_edit::DocumentMut, origen: toml_edit::DocumentMut) {
     for (clave, item) in origen.iter() {
-        combinar_item(destino.entry(clave).or_insert(toml_edit::Item::None), item.clone());
+        combinar_item(
+            destino.entry(clave).or_insert(toml_edit::Item::None),
+            item.clone(),
+        );
     }
 }
 
@@ -119,7 +122,10 @@ fn combinar_item(destino: &mut toml_edit::Item, origen: toml_edit::Item) {
     match (destino, origen) {
         (Item::Table(destino_tabla), Item::Table(origen_tabla)) => {
             for (clave, item) in origen_tabla.iter() {
-                combinar_item(destino_tabla.entry(clave).or_insert(Item::None), item.clone());
+                combinar_item(
+                    destino_tabla.entry(clave).or_insert(Item::None),
+                    item.clone(),
+                );
             }
         }
         (Item::ArrayOfTables(destino_array), Item::ArrayOfTables(origen_array)) => {

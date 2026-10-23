@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, DurationSeconds};
+use serde_with::{DurationSeconds, serde_as};
 use std::path::PathBuf;
 use std::time::Duration;
 
