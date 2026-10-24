@@ -10,8 +10,8 @@ use tracing::{error, info};
 use vasak_preload_config::Config;
 use vasak_preload_orchestrator::{
     ControlEvent, DefaultAdmissionPolicy, DefaultModelUpdater, EngineView, ExeKey,
-    GreedyPrefetchPlanner, MarkovPredictor, NoopPrefetcher, Predictor, PreloadEngine, ReloadBundle,
-    Scanner, Services, SqliteRepository, SystemClock,
+    GreedyPrefetchPlanner, MarkovPredictor, PosixFadvisePrefetcher, Predictor, PreloadEngine,
+    ReloadBundle, Scanner, Services, SqliteRepository, SystemClock,
 };
 use vasak_preload_protocol::{ConfigSnapshot, DaemonState, DaemonStats, ExeState, ExeStateWrapper};
 use zbus::fdo::Error as FdoError;
@@ -123,7 +123,7 @@ impl PreloadService {
             updater: Box::new(DefaultModelUpdater::new()),
             predictor: Box::new(MarkovPredictor::new()),
             planner: Box::new(planner_from(&config)),
-            prefetcher: Box::new(NoopPrefetcher), // Usar NoopPrefetcher por seguridad inicial
+            prefetcher: Box::new(PosixFadvisePrefetcher),
             repo: Box::new(repo),
             clock: Box::new(SystemClock),
         };
@@ -272,7 +272,7 @@ impl PreloadService {
             updater: Box::new(DefaultModelUpdater::new()),
             predictor: Box::new(MarkovPredictor::new()),
             planner: Box::new(planner_from(&new_config)),
-            prefetcher: Box::new(NoopPrefetcher),
+            prefetcher: Box::new(PosixFadvisePrefetcher),
         };
         self.send(ControlEvent::Reload(Box::new(bundle))).await?;
 

@@ -63,6 +63,24 @@ fn el_unit_es_de_usuario_y_no_pide_privilegios() {
 }
 
 #[test]
+fn la_precarga_cede_ante_el_resto_y_no_lleva_tope_de_memoria() {
+    let directives = directives();
+    let has = |d: &str| directives.iter().any(|l| l == d);
+
+    // Precargar es una optimización: E/S y CPU de menor prioridad.
+    assert!(has("IOSchedulingClass=idle"));
+    assert!(has("Nice=10"));
+    // El page cache precargado se carga al cgroup del servicio: un tope lo
+    // desalojaría él mismo.
+    for tope in ["MemoryMax=", "MemoryHigh="] {
+        assert!(
+            !directives.iter().any(|l| l.starts_with(tope)),
+            "{tope} desaloja el page cache que el servicio precarga"
+        );
+    }
+}
+
+#[test]
 fn el_unit_arranca_con_la_sesion_grafica_y_toma_su_nombre_en_el_bus() {
     let directives = directives();
     let has = |d: &str| directives.iter().any(|l| l == d);
