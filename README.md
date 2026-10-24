@@ -184,6 +184,10 @@ vasak-preload
 
 ### Requisitos
 
+- **Para correr:** Linux ≥ 5.6. La precarga abre cada archivo con `openat2`
+  (`O_PATH`, sin seguir symlinks) para no tocar dispositivos ni FIFOs; en un
+  kernel más viejo cada intento falla y no se precarga nada. No hay respaldo
+  con `open` común, a propósito.
 - **Rust:** `rustup` toolchain estable (`rust-toolchain.toml` fija la versión)
 - **Node / bun:** `bun` ≥ 1.1 (nunca npm/yarn/pnpm para apps Tauri)
 - **Sistema:** `pkg-config`, `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, `libssl-dev`

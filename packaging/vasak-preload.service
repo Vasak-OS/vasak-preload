@@ -45,5 +45,11 @@ SystemCallErrorNumber=EPERM
 # sin acceso para el resto.
 UMask=0077
 
+# La precarga es una optimización: su E/S y su CPU ceden ante todo lo demás.
+# No se pone MemoryMax/MemoryHigh: el page cache precargado se carga al cgroup
+# del servicio, y un tope lo desalojaría él mismo.
+IOSchedulingClass=idle
+Nice=10
+
 [Install]
 WantedBy=graphical-session.target

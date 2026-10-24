@@ -18,6 +18,23 @@ fn read(name: &str) -> String {
 
 /// Las directivas efectivas de la unidad, sin comentarios (una línea puede
 /// nombrar una directiva al explicarla sin configurarla).
+/// Las directivas efectivas de una sección (`[Service]`, `[Unit]`…): systemd
+/// ignora una opción de servicio que quede en otra sección.
+fn section(name: &str) -> Vec<String> {
+    let header = format!("[{name}]");
+    let mut inside = false;
+    directives()
+        .into_iter()
+        .filter(|l| {
+            if l.starts_with('[') {
+                inside = *l == header;
+                return false;
+            }
+            inside
+        })
+        .collect()
+}
+
 fn directives() -> Vec<String> {
     read("vasak-preload.service")
         .lines()
@@ -59,6 +76,24 @@ fn el_unit_es_de_usuario_y_no_pide_privilegios() {
         "SystemCallFilter=@system-service",
     ] {
         assert!(has(endurecimiento), "falta {endurecimiento}");
+    }
+}
+
+#[test]
+fn la_precarga_cede_ante_el_resto_y_no_lleva_tope_de_memoria() {
+    let directives = section("Service");
+    let has = |d: &str| directives.iter().any(|l| l == d);
+
+    // Precargar es una optimización: E/S y CPU de menor prioridad.
+    assert!(has("IOSchedulingClass=idle"));
+    assert!(has("Nice=10"));
+    // El page cache precargado se carga al cgroup del servicio: un tope lo
+    // desalojaría él mismo.
+    for tope in ["MemoryMax=", "MemoryHigh="] {
+        assert!(
+            !directives.iter().any(|l| l.starts_with(tope)),
+            "{tope} desaloja el page cache que el servicio precarga"
+        );
     }
 }
 

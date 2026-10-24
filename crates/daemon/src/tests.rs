@@ -940,3 +940,123 @@ fn el_planificador_del_servicio_respeta_la_reserva_de_la_configuracion() {
     assert_eq!(budget(0), 300);
     assert_eq!(budget(60), 0);
 }
+
+/// Como `FixedScanner`, pero el único mapa apunta a un archivo que no existe:
+/// el prefetcher real lo cuenta como fallido; `NoopPrefetcher` lo daba por
+/// bueno sin tocar el disco.
+struct MissingMapScanner;
+
+impl Scanner for MissingMapScanner {
+    fn scan(&mut self, time: u64, scan_id: u64) -> Result<Observation, EngineError> {
+        Ok(vec![
+            ObservationEvent::ObsBegin { time, scan_id },
+            ObservationEvent::MemStat {
+                mem: MemStat {
+                    total: 1000,
+                    free: 300,
+                    cached: 200,
+                    available: 500,
+                    pagein: 0,
+                    pageout: 0,
+                },
+            },
+            ObservationEvent::CandidateExe {
+                exe: CandidateExe::new("/usr/bin/bash".into(), 1),
+            },
+            ObservationEvent::Map {
+                segment: MapSegment::new(
+                    "/usr/lib/vasak-preload-no-existe.so".into(),
+                    0,
+                    100,
+                    time,
+                ),
+                pid: 1,
+            },
+            ObservationEvent::ObsEnd {
+                time,
+                scan_id,
+                warnings: Vec::new(),
+            },
+        ])
+    }
+}
+
+#[tokio::test]
+async fn el_motor_del_servicio_precarga_de_verdad_y_cuenta_lo_que_falla() {
+    let dir = TempDir::new().unwrap();
+    let mut config = config_de_prueba(dir.path());
+    config.sistema.doscan = true;
+    config.sistema.dopredict = true;
+    config.sistema.doprefetch = true;
+    // El presupuesto (la mitad de lo disponible, 500 B según el escáner) tiene
+    // que alcanzar para el mapa de 100 B.
+    config.sistema.mem_libre_min_pct = 0;
+    let service = PreloadService::new(config, ConfigSource::Default)
+        .await
+        .expect("servicio");
+    let daemon = start_daemon_scanning(service, Box::new(MissingMapScanner)).await;
+
+    let stats = timeout(APAGADO_MAXIMO, async {
+        loop {
+            let stats = daemon.proxy.stats().await.unwrap();
+            if stats.last_tick_prefetch_attempted > 0 {
+                break stats;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("el motor no llegó a planificar una precarga");
+
+    assert_eq!(stats.last_tick_prefetch_failed, 1);
+    assert_eq!(stats.last_tick_prefetch_succeeded, 0);
+    assert_eq!(stats.last_tick_prefetch_bytes, 0);
+
+    apagar(daemon.motor).await;
+}
+
+#[tokio::test]
+async fn el_motor_recargado_tambien_precarga_de_verdad() {
+    // Arranca sin precarga y la recarga la enciende: lo que ejecuta el plan
+    // después es el prefetcher que armó `ReloadConfig`.
+    let dir = TempDir::new().unwrap();
+    let estado = dir.path().join("state.sqlite");
+    let archivo = dir.path().join("config.toml");
+    std::fs::write(
+        &archivo,
+        format!(
+            "[modelo]\nciclo = 1\n\
+             [sistema]\ndoscan = true\ndopredict = true\ndoprefetch = true\n\
+             mem_libre_min_pct = 0\n\
+             [persistencia]\nestado_path = {estado:?}\n"
+        ),
+    )
+    .unwrap();
+    let source = ConfigSource::File(archivo);
+    let mut inicial = config_de_prueba(dir.path());
+    inicial.sistema.doscan = true;
+    inicial.sistema.dopredict = true;
+    let service = PreloadService::new(inicial, source)
+        .await
+        .expect("servicio");
+    let daemon = start_daemon_scanning(service, Box::new(MissingMapScanner)).await;
+
+    daemon.proxy.reload_config().await.unwrap();
+
+    let stats = timeout(APAGADO_MAXIMO, async {
+        loop {
+            let stats = daemon.proxy.stats().await.unwrap();
+            if stats.last_tick_prefetch_attempted > 0 {
+                break stats;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("el motor recargado no llegó a planificar una precarga");
+
+    assert_eq!(stats.last_tick_prefetch_failed, 1);
+    assert_eq!(stats.last_tick_prefetch_succeeded, 0);
+
+    apagar(daemon.motor).await;
+}
