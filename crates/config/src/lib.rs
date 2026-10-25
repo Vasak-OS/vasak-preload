@@ -83,12 +83,11 @@ impl Config {
                 continue;
             }
             let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(path)?.parse()?;
-            if es_del_sistema {
-                if let Some(persistencia) =
+            if es_del_sistema
+                && let Some(persistencia) =
                     doc.get_mut("persistencia").and_then(|i| i.as_table_mut())
-                {
-                    persistencia.remove("estado_path");
-                }
+            {
+                persistencia.remove("estado_path");
             }
             combinar_documento(&mut combinado, doc);
         }

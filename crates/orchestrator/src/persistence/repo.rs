@@ -4,8 +4,7 @@
 
 use crate::error::Error;
 use crate::persistence::snapshot::{
-    ExeMapRecord, ExeRecord, MapRecord, MarkovRecord, SNAPSHOT_SCHEMA_VERSION, SnapshotMeta,
-    StateSnapshot, StoresSnapshot,
+    SNAPSHOT_SCHEMA_VERSION, SnapshotMeta, StateSnapshot, StoresSnapshot,
 };
 use async_trait::async_trait;
 use serde_json;
@@ -62,7 +61,6 @@ impl StateRepository for NoopRepository {
 #[derive(Debug)]
 pub struct SqliteRepository {
     pool: sqlx::SqlitePool,
-    state_path: std::path::PathBuf,
 }
 
 /// Crea el directorio y el archivo del estado con los permisos del modelo.
@@ -139,7 +137,7 @@ impl SqliteRepository {
         .execute(&pool)
         .await?;
 
-        Ok(Self { pool, state_path })
+        Ok(Self { pool })
     }
 }
 

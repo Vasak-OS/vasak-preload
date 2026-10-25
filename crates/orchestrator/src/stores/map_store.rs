@@ -58,4 +58,30 @@ impl MapStore {
     pub fn len(&self) -> usize {
         self.inner.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn el_almacen_esta_vacio_al_crearse_y_deja_de_estarlo_con_un_mapeo() {
+        let mut store = MapStore::default();
+        assert!(store.is_empty());
+
+        store.ensure(MapSegment::new(
+            PathBuf::from("/usr/lib/libc.so"),
+            0,
+            4096,
+            0,
+        ));
+
+        assert!(!store.is_empty());
+        assert_eq!(store.len(), 1);
+    }
 }

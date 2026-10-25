@@ -8,15 +8,11 @@ use crate::domain::{MapSegment, MemStat};
 use crate::error::Error;
 use crate::observation::{CandidateExe, Observation, ObservationEvent, ScanWarning, Scanner};
 use procfs::process::{MemoryMaps, Process};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Escáner que lee /proc para obtener procesos y sus mapeos.
 #[derive(Debug, Default)]
 pub struct ProcfsScanner {
-    /// Último tiempo de muestreo para calcular deltas.
-    last_sample_time: Option<u64>,
     /// Últimas estadísticas de memoria.
     last_memstat: Option<MemStat>,
 }

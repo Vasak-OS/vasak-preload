@@ -6,11 +6,14 @@ use serde::{Deserialize, Serialize};
 use zvariant::{Error, OwnedValue, StructureBuilder, Type, Value};
 
 /// Estado del daemon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, Value, OwnedValue)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Type, Value, OwnedValue,
+)]
 #[zvariant(signature = "u")]
 #[repr(u32)]
 pub enum DaemonState {
     /// Iniciando.
+    #[default]
     Starting = 0,
     /// Ejecutándose normalmente.
     Running = 1,
@@ -18,12 +21,6 @@ pub enum DaemonState {
     Paused = 2,
     /// Deteniéndose.
     Stopping = 3,
-}
-
-impl Default for DaemonState {
-    fn default() -> Self {
-        DaemonState::Starting
-    }
 }
 
 /// Estadísticas del daemon.

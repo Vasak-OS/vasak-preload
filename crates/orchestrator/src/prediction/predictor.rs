@@ -2,7 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::domain::{ExeId, MarkovEdge, MarkovState};
+use crate::domain::{ExeId, MarkovState};
 use crate::prediction::types::{Prediction, Predictor};
 use crate::stores::Stores;
 use std::collections::HashMap;
@@ -91,8 +91,7 @@ impl Predictor for MarkovPredictor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ExeKey, MapSegment, MarkovState, MemStat};
-    use crate::observation::{DefaultAdmissionPolicy, DefaultModelUpdater, ObservationEvent};
+    use crate::domain::{ExeKey, MarkovState};
     use crate::stores::Stores;
 
     #[test]

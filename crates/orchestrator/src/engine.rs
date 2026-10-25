@@ -515,8 +515,8 @@ impl PreloadEngine {
 mod tests {
     use super::*;
     use crate::clock::test::FakeClock;
-    use crate::config::{Config, Modelo, Persistencia, Sistema};
-    use crate::domain::{ExeKey, MapKey, MapSegment, MarkovState, MemStat};
+    use crate::config::Config;
+    use crate::domain::{ExeKey, MapSegment, MarkovState, MemStat};
     use crate::observation::{AdmissionDecision, AdmissionPolicy, CandidateExe, Completeness};
     use crate::observation::{DefaultAdmissionPolicy, DefaultModelUpdater};
     use crate::observation::{ModelUpdater, Observation, ObservationEvent, Scanner};
@@ -527,8 +527,6 @@ mod tests {
     };
     use crate::stores::EdgeKey;
     use async_trait::async_trait;
-    use proptest::prelude::*;
-    use std::collections::{HashMap, HashSet};
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -764,9 +762,10 @@ mod tests {
 
     /// Lo que importa de los almacenes, sin los ids (que cambian al cargar):
     /// cada ejecutable con sus tiempos y los mapas que tiene enganchados.
-    fn ejecutables_con_mapas(
-        stores: &Stores,
-    ) -> Vec<(String, u64, Option<u64>, Vec<(String, u64, u64, u64)>)> {
+    /// (ruta, tiempo corriendo, última vez visto, mapas (ruta, offset, largo, actualización))
+    type ExeWithMaps = (String, u64, Option<u64>, Vec<(String, u64, u64, u64)>);
+
+    fn ejecutables_con_mapas(stores: &Stores) -> Vec<ExeWithMaps> {
         let mut resultado: Vec<_> = stores
             .exes
             .iter()

@@ -905,11 +905,13 @@ fn las_estadisticas_toman_los_contadores_de_los_almacenes_y_del_ultimo_tick() {
 
 #[test]
 fn un_tick_sin_datos_de_memoria_deja_el_porcentaje_en_255() {
-    let mut view = EngineView::default();
-    view.last_tick = Some(TickReport {
-        memstat: None,
-        ..full_tick()
-    });
+    let view = EngineView {
+        last_tick: Some(TickReport {
+            memstat: None,
+            ..full_tick()
+        }),
+        ..EngineView::default()
+    };
 
     let stats = stats_from_view(DaemonState::Running, &view);
 

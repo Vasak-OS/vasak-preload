@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Reloj que proporciona tiempo y sleep.
 #[async_trait]

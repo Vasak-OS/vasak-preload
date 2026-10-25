@@ -2,15 +2,13 @@
 
 #![forbid(unsafe_code)]
 
-use crate::domain::{ExeId, ExeKey, MapId, MapKey, MapSegment, MarkovEdge, MarkovState};
+use crate::domain::{ExeId, ExeKey, MarkovState};
 use crate::error::Error;
 use crate::observation::{
     AdmissionDecision, AdmissionPolicy, CandidateExe, Completeness, Observation, ObservationEvent,
-    ScanWarning,
 };
 use crate::stores::{EdgeKey, Stores};
 use std::collections::HashMap;
-use std::path::Path;
 
 /// Cambios en el modelo tras una actualización.
 #[derive(Debug, Clone, Default)]
@@ -53,7 +51,6 @@ impl ModelUpdater for DefaultModelUpdater {
         let mut delta = ModelDelta::default();
         let mut current_time = stores.model_time;
         let mut candidates: HashMap<u32, CandidateExe> = HashMap::new();
-        let mut memstat = None;
 
         // Procesar eventos
         for event in observation {
@@ -61,14 +58,13 @@ impl ModelUpdater for DefaultModelUpdater {
                 ObservationEvent::ObsBegin { time, .. } => {
                     current_time = *time;
                 }
-                ObservationEvent::MemStat { mem } => {
-                    memstat = Some(*mem);
-                }
+                // La memoria la usa el planificador, no el modelo.
+                ObservationEvent::MemStat { .. } => {}
                 ObservationEvent::CandidateExe { exe } => {
                     candidates.insert(exe.pid, exe.clone());
                 }
                 ObservationEvent::Map { segment, pid } => {
-                    if let Some(candidate) = candidates.get_mut(&pid) {
+                    if let Some(candidate) = candidates.get_mut(pid) {
                         candidate.maps.push(segment.clone());
                         candidate.total_size += segment.length;
                     }
@@ -80,7 +76,7 @@ impl ModelUpdater for DefaultModelUpdater {
         // Determinar qué ejecutables están corriendo ahora
         let mut running_exes: HashMap<ExeId, bool> = HashMap::new();
 
-        for (pid, candidate) in candidates {
+        for (_pid, candidate) in candidates {
             let decision = policy.decide(&candidate);
 
             match decision {
@@ -120,12 +116,11 @@ impl ModelUpdater for DefaultModelUpdater {
         // Marcar ejecutables que ya no corren
         let exe_ids: Vec<ExeId> = stores.exes.iter().map(|(id, _)| id).collect();
         for exe_id in exe_ids {
-            if !running_exes.contains_key(&exe_id) {
-                if let Some(exe_mut) = stores.exes.get_mut(exe_id) {
-                    if exe_mut.running {
-                        exe_mut.mark_stopped(current_time);
-                    }
-                }
+            if !running_exes.contains_key(&exe_id)
+                && let Some(exe_mut) = stores.exes.get_mut(exe_id)
+                && exe_mut.running
+            {
+                exe_mut.mark_stopped(current_time);
             }
         }
 
@@ -197,6 +192,7 @@ mod tests {
     use crate::domain::{ExeKey, MapSegment, MemStat};
     use crate::observation::{DefaultAdmissionPolicy, ObservationEvent};
     use crate::stores::Stores;
+    use std::path::Path;
 
     #[test]
     fn actualiza_modelo_basico() {
@@ -366,7 +362,9 @@ mod tests {
     fn cada_arista_se_observa_una_sola_vez_por_tick() {
         let mut stores = Stores::default();
         let mut updater = DefaultModelUpdater::new();
-        let steps: [(u64, &[(&str, u32)], u32, u32); 3] = [
+        // (tiempo, ejecutables que corren con su pid, aristas nuevas, observadas)
+        type Step<'a> = (u64, &'a [(&'a str, u32)], u32, u32);
+        let steps: [Step; 3] = [
             (0, &[("/a", 1), ("/b", 2)], 1, 1),
             // `c` arranca: dos aristas nuevas y la de (a, b) ya existente.
             (20, &[("/a", 1), ("/b", 2), ("/c", 3)], 2, 3),
