@@ -1,8 +1,6 @@
 //! Instantánea del estado para persistencia.
 
-use crate::domain::{ExeKey, MapKey, MapSegment, MarkovEdge, MarkovState};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 /// Versión del esquema de instantánea.
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;

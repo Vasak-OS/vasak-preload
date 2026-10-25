@@ -21,6 +21,11 @@ fn el_estado_del_daemon_viaja_como_un_u32() {
 }
 
 #[test]
+fn el_estado_por_omision_del_daemon_es_iniciando() {
+    assert_eq!(DaemonState::default(), DaemonState::Starting);
+}
+
+#[test]
 fn el_estado_del_daemon_ida_y_vuelta_por_owned_value() {
     for (estado, _) in ESTADOS {
         let owned = OwnedValue::try_from(Value::from(estado)).expect("a OwnedValue");

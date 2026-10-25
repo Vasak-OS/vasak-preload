@@ -37,6 +37,10 @@ impl MarkovGraph {
         self.inner.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     /// Poda aristas que involucran ejecutables inactivos.
     pub fn prune_inactive(&mut self, active_exes: &std::collections::HashSet<ExeId>) {
         self.inner
@@ -151,5 +155,27 @@ mod tests {
         graph.prune_inactive(&HashSet::new());
 
         assert_eq!(graph.len(), 0);
+    }
+
+    #[test]
+    fn el_grafo_esta_vacio_al_crearse_y_deja_de_estarlo_con_una_arista() {
+        let (a, b, _) = distinct_ids();
+        let mut graph = MarkovGraph::default();
+        assert!(graph.is_empty());
+
+        graph.ensure_edge(a, b, 0, MarkovState::Neither);
+
+        assert!(!graph.is_empty());
+    }
+
+    #[test]
+    fn el_grafo_vuelve_a_estar_vacio_tras_podar_con_el_conjunto_vacio() {
+        let (a, b, _) = distinct_ids();
+        let mut graph = MarkovGraph::default();
+        graph.ensure_edge(a, b, 0, MarkovState::Neither);
+
+        graph.prune_inactive(&HashSet::new());
+
+        assert!(graph.is_empty());
     }
 }

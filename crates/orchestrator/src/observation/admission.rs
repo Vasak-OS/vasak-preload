@@ -2,7 +2,6 @@
 
 #![forbid(unsafe_code)]
 
-use crate::domain::MapSegment;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
